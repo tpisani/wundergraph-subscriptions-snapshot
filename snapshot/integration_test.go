@@ -41,29 +41,29 @@ const (
 func TestIntegrationLateSubscriberGetsSnapshot(t *testing.T) {
 	env := startEnv(t, "")
 
-	alice := env.subscribe(t, sseClient, "Bearer alice", `{"symbol":"ABC"}`)
+	alice := env.subscribe(t, sseClient, "Bearer alice", `{"matchId":"m1"}`)
 	env.sub.waitOpened(t, 1)
-	env.sub.publish(1)
-	alice.expect(t, `{"price":{"symbol":"ABC","value":1}}`)
-	env.sub.publish(2)
-	alice.expect(t, `{"price":{"symbol":"ABC","value":2}}`)
+	env.sub.publish(homeGoal)
+	alice.expect(t, want("m1", homeGoal))
+	env.sub.publish(awayEqualizer)
+	alice.expect(t, want("m1", awayEqualizer))
 
 	// Joins the deduplicated subscription: gets the current state right away.
-	late := env.subscribe(t, sseClient, "Bearer alice", `{"symbol":"ABC"}`)
-	late.expect(t, `{"price":{"symbol":"ABC","value":2}}`)
+	late := env.subscribe(t, sseClient, "Bearer alice", `{"matchId":"m1"}`)
+	late.expect(t, want("m1", awayEqualizer))
 
 	// Multipart clients are served from the same snapshot.
-	multipart := env.subscribe(t, multipartClient, "Bearer alice", `{"symbol":"ABC"}`)
-	multipart.expect(t, `{"price":{"symbol":"ABC","value":2}}`)
+	multipart := env.subscribe(t, multipartClient, "Bearer alice", `{"matchId":"m1"}`)
+	multipart.expect(t, want("m1", awayEqualizer))
 
 	if got := env.sub.opened.Load(); got != 1 {
 		t.Fatalf("expected one deduplicated upstream stream, got %d", got)
 	}
 
 	// Afterwards everybody keeps receiving live updates, without duplicates.
-	env.sub.publish(3)
+	env.sub.publish(homeWinner)
 	for _, c := range []*client{alice, late, multipart} {
-		c.expect(t, `{"price":{"symbol":"ABC","value":3}}`)
+		c.expect(t, want("m1", homeWinner))
 		c.expectQuiet(t)
 	}
 }
@@ -71,40 +71,40 @@ func TestIntegrationLateSubscriberGetsSnapshot(t *testing.T) {
 func TestIntegrationNoSnapshotAcrossUsersOrArguments(t *testing.T) {
 	env := startEnv(t, "")
 
-	alice := env.subscribe(t, sseClient, "Bearer alice", `{"symbol":"ABC"}`)
+	alice := env.subscribe(t, sseClient, "Bearer alice", `{"matchId":"m1"}`)
 	env.sub.waitOpened(t, 1)
-	env.sub.publish(1)
-	alice.expect(t, `{"price":{"symbol":"ABC","value":1}}`)
+	env.sub.publish(homeGoal)
+	alice.expect(t, want("m1", homeGoal))
 
 	// Authorization is not forwarded to the subgraph, so the router shares the
 	// upstream stream with bob, but bob must not receive alice's snapshot.
-	bob := env.subscribe(t, sseClient, "Bearer bob", `{"symbol":"ABC"}`)
-	anonymous := env.subscribe(t, sseClient, "", `{"symbol":"ABC"}`)
+	bob := env.subscribe(t, sseClient, "Bearer bob", `{"matchId":"m1"}`)
+	anonymous := env.subscribe(t, sseClient, "", `{"matchId":"m1"}`)
 	bob.expectQuiet(t)
 	anonymous.expectQuiet(t)
 
 	// Different arguments, also when passed as inline literals.
-	otherVar := env.subscribe(t, sseClient, "Bearer alice", `{"symbol":"XYZ"}`)
-	otherInline := env.subscribeQuery(t, sseClient, "Bearer alice", `subscription { price(symbol: "XYZ") { symbol value } }`, "")
+	otherVar := env.subscribe(t, sseClient, "Bearer alice", `{"matchId":"m2"}`)
+	otherInline := env.subscribeQuery(t, sseClient, "Bearer alice", `subscription { matchUpdated(matchId: "m2") { id minute score { home away } } }`, "")
 	otherVar.expectQuiet(t)
 	otherInline.expectQuiet(t)
 
-	env.sub.publish(2)
-	bob.expect(t, `{"price":{"symbol":"ABC","value":2}}`)
+	env.sub.publish(awayEqualizer)
+	bob.expect(t, want("m1", awayEqualizer))
 }
 
 func TestIntegrationNoStaleSnapshotAfterUpstreamCloses(t *testing.T) {
 	env := startEnv(t, "")
 
-	first := env.subscribe(t, sseClient, "Bearer alice", `{"symbol":"ABC"}`)
+	first := env.subscribe(t, sseClient, "Bearer alice", `{"matchId":"m1"}`)
 	env.sub.waitOpened(t, 1)
-	env.sub.publish(1)
-	first.expect(t, `{"price":{"symbol":"ABC","value":1}}`)
+	env.sub.publish(homeGoal)
+	first.expect(t, want("m1", homeGoal))
 
 	first.close()
 	env.sub.waitOpen(t, 0) // the router closed the upstream stream
 
-	again := env.subscribe(t, sseClient, "Bearer alice", `{"symbol":"ABC"}`)
+	again := env.subscribe(t, sseClient, "Bearer alice", `{"matchId":"m1"}`)
 	env.sub.waitOpened(t, 2)
 	again.expectQuiet(t)
 }
@@ -112,13 +112,29 @@ func TestIntegrationNoStaleSnapshotAfterUpstreamCloses(t *testing.T) {
 func TestIntegrationSharedSnapshotWithoutKeyHeaders(t *testing.T) {
 	env := startEnv(t, "    key_headers: []\n")
 
-	alice := env.subscribe(t, sseClient, "Bearer alice", `{"symbol":"ABC"}`)
+	alice := env.subscribe(t, sseClient, "Bearer alice", `{"matchId":"m1"}`)
 	env.sub.waitOpened(t, 1)
-	env.sub.publish(1)
-	alice.expect(t, `{"price":{"symbol":"ABC","value":1}}`)
+	env.sub.publish(homeGoal)
+	alice.expect(t, want("m1", homeGoal))
 
-	bob := env.subscribe(t, sseClient, "Bearer bob", `{"symbol":"ABC"}`)
-	bob.expect(t, `{"price":{"symbol":"ABC","value":1}}`)
+	bob := env.subscribe(t, sseClient, "Bearer bob", `{"matchId":"m1"}`)
+	bob.expect(t, want("m1", homeGoal))
+}
+
+// --- match updates ---------------------------------------------------------
+
+// update is a live match state published by the subgraph.
+type update struct{ minute, home, away int }
+
+var (
+	homeGoal      = update{minute: 12, home: 1, away: 0}
+	awayEqualizer = update{minute: 34, home: 1, away: 1}
+	homeWinner    = update{minute: 67, home: 2, away: 1}
+)
+
+// want returns the compact `data` object clients receive for match id in state u.
+func want(id string, u update) string {
+	return fmt.Sprintf(`{"matchUpdated":{"id":%q,"minute":%d,"score":{"home":%d,"away":%d}}}`, id, u.minute, u.home, u.away)
 }
 
 // --- environment -----------------------------------------------------------
@@ -240,20 +256,20 @@ func waitReady(routerURL string, startErr <-chan error) error {
 
 // --- subgraph --------------------------------------------------------------
 
-// subgraph serves `subscription { price(symbol) }` over GraphQL SSE and only
-// emits a message when publish is called.
+// subgraph serves `subscription { matchUpdated(matchId) }` over GraphQL SSE
+// and only emits a message when publish is called.
 type subgraph struct {
 	opened atomic.Int64
 	open   atomic.Int64
 
 	mu      sync.Mutex
-	streams map[chan int]string // channel -> symbol
+	streams map[chan update]string // channel -> match id
 	done    chan struct{}
 	once    sync.Once
 }
 
 func newSubgraph() *subgraph {
-	return &subgraph{streams: map[chan int]string{}, done: make(chan struct{})}
+	return &subgraph{streams: map[chan update]string{}, done: make(chan struct{})}
 }
 
 func (s *subgraph) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -264,14 +280,14 @@ func (s *subgraph) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	if !strings.Contains(r.Header.Get("Accept"), "text/event-stream") {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"data":{"hello":"world"}}`))
+		_, _ = w.Write([]byte(`{"data":{"status":"ok"}}`))
 		return
 	}
 
-	symbol := "?"
+	matchID := "?"
 	for _, v := range body.Variables { // the router may rename variables
 		if str, ok := v.(string); ok {
-			symbol = str
+			matchID = str
 		}
 	}
 
@@ -280,9 +296,9 @@ func (s *subgraph) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	flusher.Flush()
 
-	ch := make(chan int, 16)
+	ch := make(chan update, 16)
 	s.mu.Lock()
-	s.streams[ch] = symbol
+	s.streams[ch] = matchID
 	s.mu.Unlock()
 	s.opened.Add(1)
 	s.open.Add(1)
@@ -299,18 +315,18 @@ func (s *subgraph) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		case <-s.done:
 			return
-		case v := <-ch:
-			_, _ = fmt.Fprintf(w, "event: next\ndata: {\"data\":{\"price\":{\"symbol\":%q,\"value\":%d}}}\n\n", symbol, v)
+		case u := <-ch:
+			_, _ = fmt.Fprintf(w, "event: next\ndata: {\"data\":%s}\n\n", want(matchID, u))
 			flusher.Flush()
 		}
 	}
 }
 
-func (s *subgraph) publish(v int) {
+func (s *subgraph) publish(u update) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for ch := range s.streams {
-		ch <- v
+		ch <- u
 	}
 }
 
@@ -352,10 +368,10 @@ type client struct {
 	data   chan string
 }
 
-const priceQuery = `subscription OnPrice($symbol: String!) { price(symbol: $symbol) { symbol value } }`
+const matchQuery = `subscription OnMatchUpdated($matchId: ID!) { matchUpdated(matchId: $matchId) { id minute score { home away } } }`
 
 func (e *env) subscribe(t *testing.T, kind clientKind, auth, variables string) *client {
-	return e.subscribeQuery(t, kind, auth, priceQuery, variables)
+	return e.subscribeQuery(t, kind, auth, matchQuery, variables)
 }
 
 func (e *env) subscribeQuery(t *testing.T, kind clientKind, auth, query, variables string) *client {

@@ -2,9 +2,9 @@
 # the integration test replaces with the address of its in-process subgraph.
 version: 1
 subgraphs:
-  - name: prices
+  - name: sports
     routing_url: http://subgraph.invalid/graphql
     schema:
-      file: ./prices.graphql
+      file: ./sports.graphql
     subscription:
       protocol: sse_post

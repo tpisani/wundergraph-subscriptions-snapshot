@@ -58,7 +58,7 @@ func engineBytes(t *testing.T, data string) string {
 }
 
 func TestTapPassesBytesThroughUnchanged(t *testing.T) {
-	stream := "event: next\ndata: {\"data\":{\"price\":1}}\n\n: keep-alive\n\nevent: next\r\ndata: {\"data\":{\"price\":2}}\r\n\r\n"
+	stream := "event: next\ndata: {\"data\":{\"minute\":1}}\n\n: keep-alive\n\nevent: next\r\ndata: {\"data\":{\"minute\":2}}\r\n\r\n"
 	var r recorder
 	tap, _ := r.tap(stream, 3, 1<<20)
 
@@ -73,10 +73,10 @@ func TestTapPassesBytesThroughUnchanged(t *testing.T) {
 
 func TestTapRecordsDataEventsAcrossChunks(t *testing.T) {
 	stream := strings.Join([]string{
-		"event: next\ndata: {\"data\":{\"price\":1}}\n\n",
+		"event: next\ndata: {\"data\":{\"minute\":1}}\n\n",
 		": comment\n\n",
-		"event: next\r\ndata: {\"data\":{\"price\":2},\"extensions\":{\"x\":1}}\r\n\r\n",
-		"data: {\"data\":{\"price\":3}}\n\n", // untyped event = data
+		"event: next\r\ndata: {\"data\":{\"minute\":2},\"extensions\":{\"x\":1}}\r\n\r\n",
+		"data: {\"data\":{\"minute\":3}}\n\n", // untyped event = data
 	}, "")
 
 	for _, chunk := range []int{1, 2, 7, 4096} {
@@ -86,9 +86,9 @@ func TestTapRecordsDataEventsAcrossChunks(t *testing.T) {
 			t.Fatal(err)
 		}
 		want := []string{
-			engineBytes(t, `{"data":{"price":1}}`),
-			engineBytes(t, `{"data":{"price":2},"extensions":{"x":1}}`),
-			engineBytes(t, `{"data":{"price":3}}`),
+			engineBytes(t, `{"data":{"minute":1}}`),
+			engineBytes(t, `{"data":{"minute":2},"extensions":{"x":1}}`),
+			engineBytes(t, `{"data":{"minute":3}}`),
 		}
 		if strings.Join(r.payloads, "|") != strings.Join(want, "|") {
 			t.Fatalf("chunk=%d: got %q want %q", chunk, r.payloads, want)

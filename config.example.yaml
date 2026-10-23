@@ -2,7 +2,7 @@
 version: "1"
 
 # Subgraphs that serve subscriptions must use SSE towards the router:
-#   npx wgc subgraph publish prices --subscription-protocol sse_post ...
+#   npx wgc subgraph publish sports --subscription-protocol sse_post ...
 # (or `subscription: { protocol: sse_post }` in a local graph.yaml).
 # Clients can keep using graphql-ws, SSE or multipart.
 

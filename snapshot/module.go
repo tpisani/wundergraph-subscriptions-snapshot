@@ -64,7 +64,7 @@ func init() {
 //	modules:
 //	  subscriptionSnapshot:
 //	    key_headers: ["Authorization"] # client headers that identify who may see a snapshot
-//	    operations: ["OnPriceChanged"] # operation names to snapshot; empty = all subscriptions
+//	    operations: ["OnMatchUpdated"] # operation names to snapshot; empty = all subscriptions
 //	    ttl: "10m"                     # discard snapshots older than this; empty/"0" = never
 //	    max_entries: 10000             # max stored snapshots; 0 = default, -1 = unbounded
 //	    max_total_bytes: 268435456     # max total snapshot size; 0 = default (256 MiB), -1 = unbounded

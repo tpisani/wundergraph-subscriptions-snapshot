@@ -35,6 +35,41 @@ A client only receives a snapshot recorded with the **same** `Authorization` val
 
 **Ordering.** The module registers with priority `10000` (lower numbers run first), so authorization modules with a lower priority can reject a client in `SubscriptionOnStart` before a snapshot is emitted, and this module sees subgraph responses after other `OnOriginResponse` handlers.
 
+## Example: live match scores
+
+A `sports` subgraph streams the state of a match every time it changes:
+
+```graphql
+type Match {
+  id: ID!
+  minute: Int!
+  score: Score!
+}
+
+type Score {
+  home: Int!
+  away: Int!
+}
+
+type Subscription {
+  matchUpdated(matchId: ID!): Match!
+}
+```
+
+Thousands of fans open the same match:
+
+```graphql
+subscription OnMatchUpdated($matchId: ID!) {
+  matchUpdated(matchId: $matchId) {
+    id
+    minute
+    score { home away }
+  }
+}
+```
+
+Without the module, a fan who opens the app in the 70th minute sees nothing until the next goal or minute update. With it, the router immediately sends that fan the latest state of the match from the shared upstream stream, and then the live updates. With the default `key_headers: [Authorization]`, a fan only reuses snapshots recorded with the same token. Scores are public, so if every subscription that goes through the module is public (or you restrict it with `operations`), `key_headers: []` lets every fan share the same snapshot (see [Security and correctness notes](#security-and-correctness-notes)).
+
 ## Requirement: SSE between router and subgraph
 
 The module only observes the **SSE** protocol between the router and the subgraph. Over WebSocket, the router multiplexes many subscriptions over a single connection, which cannot be observed safely.
@@ -42,15 +77,15 @@ The module only observes the **SSE** protocol between the router and the subgrap
 This does **not** affect clients: they keep using graphql-ws, SSE or multipart, and the router translates between protocols.
 
 ```bash
-npx wgc subgraph publish prices --subscription-protocol sse_post --schema prices.graphql
+npx wgc subgraph publish sports --subscription-protocol sse_post --schema sports.graphql
 ```
 
 Or in a local `graph.yaml`:
 
 ```yaml
 subgraphs:
-  - name: prices
-    routing_url: http://prices:4001/graphql
+  - name: sports
+    routing_url: http://sports:4001/graphql
     subscription:
       protocol: sse_post   # or sse (GET)
 ```
@@ -128,8 +163,8 @@ go test -race ./...            # unit tests + in-process router integration test
 
 The integration tests start the real Cosmo Router in-process, built from a config file through the same `RouterSupervisor` the router binary uses, against an in-process SSE subgraph that only emits a message when the test publishes one. They verify that:
 
-- a late subscriber receives the current state immediately, over SSE and multipart, and then live updates without duplicates;
-- a client with another `Authorization`, an anonymous client or a client with other arguments (variables or inline literals) never receives the snapshot, even when sharing the upstream stream;
+- a fan who joins a match late receives its current score immediately, over SSE and multipart, and then live updates without duplicates;
+- a client with another `Authorization`, an anonymous client or a client following another match (variables or inline literals) never receives the snapshot, even when sharing the upstream stream;
 - no stale snapshot is served after the upstream stream closes;
 - with `key_headers: []`, every client shares the snapshot.
 

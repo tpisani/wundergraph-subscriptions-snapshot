@@ -98,7 +98,7 @@ func sseResponse(stream string) *http.Response {
 	}
 }
 
-var priceOp = &fakeOp{name: "OnPrice", typ: "subscription", hash: 42, vars: `{"symbol":"ABC"}`}
+var matchOp = &fakeOp{name: "OnMatchUpdated", typ: "subscription", hash: 42, vars: `{"matchId":"m1"}`}
 
 // upstream simulates the engine reading the subgraph SSE stream that was
 // opened for the first subscriber (the trigger owner).
@@ -113,8 +113,8 @@ func upstream(t *testing.T, m *Module, op core.OperationContext, auth, stream st
 
 func TestReplaysLastUpstreamMessageToLateSubscriber(t *testing.T) {
 	m := provisioned(t, &Module{})
-	stream := "event: next\ndata: {\"data\":{\"price\":1}}\n\nevent: next\ndata: {\"data\":{\"price\":2}}\n\n"
-	resp := upstream(t, m, priceOp, "Bearer alice", stream)
+	stream := "event: next\ndata: {\"data\":{\"minute\":1}}\n\nevent: next\ndata: {\"data\":{\"minute\":2}}\n\n"
+	resp := upstream(t, m, matchOp, "Bearer alice", stream)
 
 	// Read only part of the stream: the subscription is still live.
 	buf := make([]byte, len(stream))
@@ -123,26 +123,26 @@ func TestReplaysLastUpstreamMessageToLateSubscriber(t *testing.T) {
 		t.Fatal("engine must see the original stream")
 	}
 
-	late := &fakeStartCtx{op: &fakeOp{name: "OnPrice", typ: "subscription", hash: 42, vars: `{"symbol":"ABC"}`}, req: clientReq("Bearer alice")}
+	late := &fakeStartCtx{op: &fakeOp{name: "OnMatchUpdated", typ: "subscription", hash: 42, vars: `{"matchId":"m1"}`}, req: clientReq("Bearer alice")}
 	if err := m.SubscriptionOnStart(late); err != nil {
 		t.Fatal(err)
 	}
-	if len(late.emitted) != 1 || late.emitted[0] != `{"data":{"price":2}}` {
+	if len(late.emitted) != 1 || late.emitted[0] != `{"data":{"minute":2}}` {
 		t.Fatalf("expected latest upstream message, got %q", late.emitted)
 	}
 }
 
 func TestDoesNotLeakAcrossUsersOrVariables(t *testing.T) {
 	m := provisioned(t, &Module{})
-	resp := upstream(t, m, priceOp, "Bearer alice", "event: next\ndata: {\"data\":{\"price\":1}}\n\n")
+	resp := upstream(t, m, matchOp, "Bearer alice", "event: next\ndata: {\"data\":{\"minute\":1}}\n\n")
 	buf := make([]byte, 64)
 	_, _ = resp.Body.Read(buf)
 
 	for name, sc := range map[string]*fakeStartCtx{
-		"other user":      {op: priceOp, req: clientReq("Bearer bob")},
-		"anonymous":       {op: priceOp, req: clientReq("")},
-		"other variables": {op: &fakeOp{name: "OnPrice", typ: "subscription", hash: 42, vars: `{"symbol":"XYZ"}`}, req: clientReq("Bearer alice")},
-		"other operation": {op: &fakeOp{name: "OnPrice", typ: "subscription", hash: 43, vars: `{"symbol":"ABC"}`}, req: clientReq("Bearer alice")},
+		"other user":      {op: matchOp, req: clientReq("Bearer bob")},
+		"anonymous":       {op: matchOp, req: clientReq("")},
+		"other variables": {op: &fakeOp{name: "OnMatchUpdated", typ: "subscription", hash: 42, vars: `{"matchId":"m2"}`}, req: clientReq("Bearer alice")},
+		"other operation": {op: &fakeOp{name: "OnMatchUpdated", typ: "subscription", hash: 43, vars: `{"matchId":"m1"}`}, req: clientReq("Bearer alice")},
 	} {
 		_ = m.SubscriptionOnStart(sc)
 		if len(sc.emitted) != 0 {
@@ -153,11 +153,11 @@ func TestDoesNotLeakAcrossUsersOrVariables(t *testing.T) {
 
 func TestSnapshotDroppedWhenUpstreamEnds(t *testing.T) {
 	m := provisioned(t, &Module{})
-	resp := upstream(t, m, priceOp, "Bearer alice", "event: next\ndata: {\"data\":{\"price\":1}}\n\n")
+	resp := upstream(t, m, matchOp, "Bearer alice", "event: next\ndata: {\"data\":{\"minute\":1}}\n\n")
 	_, _ = io.ReadAll(resp.Body) // stream ends (EOF)
 	_ = resp.Body.Close()
 
-	sc := &fakeStartCtx{op: priceOp, req: clientReq("Bearer alice")}
+	sc := &fakeStartCtx{op: matchOp, req: clientReq("Bearer alice")}
 	_ = m.SubscriptionOnStart(sc)
 	if len(sc.emitted) != 0 {
 		t.Fatal("a finished upstream stream must not leave a snapshot behind")
@@ -177,12 +177,12 @@ func TestIgnoresNonSubscriptionAndNonSSEResponses(t *testing.T) {
 
 	jsonResp := &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(`{}`))}
 	orig = jsonResp.Body
-	m.OnOriginResponse(jsonResp, &fakeReqCtx{op: priceOp, req: clientReq("")})
+	m.OnOriginResponse(jsonResp, &fakeReqCtx{op: matchOp, req: clientReq("")})
 	if jsonResp.Body != orig {
 		t.Fatal("non-SSE responses (e.g. entity fetches) must not be tapped")
 	}
 
-	if m.OnOriginResponse(nil, &fakeReqCtx{op: priceOp}) != nil {
+	if m.OnOriginResponse(nil, &fakeReqCtx{op: matchOp}) != nil {
 		t.Fatal("nil response must be ignored")
 	}
 }
@@ -191,7 +191,7 @@ func TestOperationsAllowlist(t *testing.T) {
 	m := provisioned(t, &Module{Operations: []string{"Other"}})
 	resp := sseResponse("event: next\ndata: {\"data\":{\"a\":1}}\n\n")
 	orig := resp.Body
-	m.OnOriginResponse(resp, &fakeReqCtx{op: priceOp, req: clientReq("")})
+	m.OnOriginResponse(resp, &fakeReqCtx{op: matchOp, req: clientReq("")})
 	if resp.Body != orig {
 		t.Fatal("operations outside the allowlist must not be tapped")
 	}
@@ -199,10 +199,10 @@ func TestOperationsAllowlist(t *testing.T) {
 
 func TestSkipsEDFSSubscriptions(t *testing.T) {
 	m := provisioned(t, &Module{})
-	resp := upstream(t, m, priceOp, "", "event: next\ndata: {\"data\":{\"a\":1}}\n\n")
+	resp := upstream(t, m, matchOp, "", "event: next\ndata: {\"data\":{\"a\":1}}\n\n")
 	_, _ = resp.Body.Read(make([]byte, 64))
 
-	sc := &fakeStartCtx{op: priceOp, req: clientReq(""), evCfg: &nats.SubscriptionEventConfiguration{Subjects: []string{"x"}}}
+	sc := &fakeStartCtx{op: matchOp, req: clientReq(""), evCfg: &nats.SubscriptionEventConfiguration{Subjects: []string{"x"}}}
 	_ = m.SubscriptionOnStart(sc)
 	if len(sc.emitted) != 0 {
 		t.Fatal("EDFS subscriptions are out of scope")
@@ -214,7 +214,7 @@ func TestConfigDecoding(t *testing.T) {
 	m := &Module{}
 	err := mapstructure.Decode(map[string]any{
 		"key_headers":     []any{"authorization", "x-tenant-id", "X-Tenant-Id"},
-		"operations":      []any{"OnPrice"},
+		"operations":      []any{"OnMatchUpdated"},
 		"ttl":             "5m",
 		"max_entries":     5,
 		"max_event_bytes": 2048,
@@ -276,7 +276,7 @@ func TestDefaults(t *testing.T) {
 
 func TestCleanupDropsSnapshots(t *testing.T) {
 	m := provisioned(t, &Module{})
-	resp := upstream(t, m, priceOp, "", "event: next\ndata: {\"data\":{\"a\":1}}\n\n")
+	resp := upstream(t, m, matchOp, "", "event: next\ndata: {\"data\":{\"a\":1}}\n\n")
 	_, _ = resp.Body.Read(make([]byte, 64))
 	if m.store.Len() != 1 {
 		t.Fatal("expected a stored snapshot")

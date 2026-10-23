@@ -1,0 +1,18 @@
+type Query {
+  status: String
+}
+
+type Score {
+  home: Int!
+  away: Int!
+}
+
+type Match {
+  id: ID!
+  minute: Int!
+  score: Score!
+}
+
+type Subscription {
+  matchUpdated(matchId: ID!): Match!
+}
