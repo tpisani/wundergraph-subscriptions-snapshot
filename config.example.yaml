@@ -1,0 +1,20 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/wundergraph/cosmo/main/router/pkg/config/config.schema.json
+version: "1"
+
+events:
+  providers:
+    nats:
+      - id: default
+        url: "nats://localhost:4222"
+
+modules:
+  subscriptionSnapshot:
+    # Root subscription fields that get a snapshot. Empty/omitted = every
+    # Cosmo Streams (EDFS) subscription.
+    fields:
+      - employeeUpdated
+    # Discard snapshots older than this (Go duration). Empty or "0" = never.
+    ttl: "10m"
+    # Max number of distinct subscriptions (provider + subjects) kept in memory.
+    # 0 = default (10000), -1 = unbounded.
+    max_entries: 10000
