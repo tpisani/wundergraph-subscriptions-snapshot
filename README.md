@@ -1,115 +1,153 @@
 # wundergraph-subscriptions-snapshot
 
-Custom module para o [Cosmo Router](https://github.com/wundergraph/cosmo) que envia a **última mensagem** de uma subscription servida por subgraph para cada cliente **no momento em que ele se inscreve**, mantendo a deduplicação do router.
+A [Cosmo Router](https://github.com/wundergraph/cosmo) custom module that sends the **latest message** of a subgraph-served GraphQL subscription to every client **as soon as it subscribes**, while keeping the router's subscription deduplication.
 
-## O problema
+## The problem
 
-Com deduplicação, todos os clientes que assinam a mesma operação com as mesmas variáveis (e os mesmos headers repassados) compartilham **uma única** subscription do router com o subgraph. Quem entra depois só recebe as mensagens futuras e fica sem dados até a próxima atualização.
+With deduplication, all clients that subscribe with the same operation and variables (and the same headers forwarded to the subgraph) share **one** subscription between the router and the subgraph. A client that joins later only receives future messages, so it shows nothing until the next update.
 
-## Como funciona
+## How it works
 
 ```
-cliente A ──┐                         ┌── tap: guarda a última mensagem
-cliente B ──┼── router (dedup) ── SSE ┤      (chave = operação + variáveis + headers)
-cliente C ──┘                         └── subgraph
+client A ──┐                          ┌── tap: remembers the last message
+client B ──┼── router (dedup) ── SSE ─┤      key = operation + variables + identity headers
+client C ──┘                          └── subgraph
 ```
 
-O módulo usa dois pontos de extensão públicos do router:
+The module uses two public extension points of the router:
 
-| Hook | O que faz |
+| Hook | What it does |
 |---|---|
-| `OnOriginResponse` | Quando o subgraph responde a uma subscription com `text/event-stream`, envolve o corpo da resposta com um leitor que **repassa todos os bytes intactos** para a engine e, em paralelo, guarda a última mensagem de dados. O parsing é uma cópia exata do que a engine faz. |
-| `SubscriptionOnStart` | Roda para **cada** cliente que assina, inclusive quem entra numa subscription já deduplicada. Se existe uma mensagem guardada para a chave do cliente, ela é emitida **só para ele** com `EmitEvent`. |
+| `EnginePostOriginHandler` (`OnOriginResponse`) | When a subgraph answers a subscription with `text/event-stream`, the response body is wrapped with a reader that **passes every byte through unchanged** to the engine and, on the side, keeps the last data message. Event parsing mirrors the engine exactly. |
+| `SubscriptionOnStartHandler` (`SubscriptionOnStart`) | Runs for **every** subscribing client, including clients that join an already deduplicated subscription. If a message is stored for the client's key, it is emitted **to that client only** with `EmitEvent`. |
 
-A mensagem guardada é a resposta completa do subgraph, no mesmo formato que a engine recebe. A engine a trata como uma mensagem vinda do subgraph e resolve a seleção do próprio cliente, incluindo campos de entidades buscados em outros subgraphs.
+The stored message is the full subgraph response, in the format the engine receives. The engine treats it exactly like a message from the subgraph and resolves the client's own selection set, including entity fields fetched from other subgraphs.
 
-**A chave do snapshot** é um SHA-256 de:
-- hash normalizado da operação,
-- variáveis (com as chaves ordenadas),
-- valores dos headers em `key_headers` (padrão: `Authorization`).
+**Snapshot key.** A SHA-256 digest of:
 
-Um cliente só recebe snapshot gravado com o **mesmo** `Authorization`. Como os valores entram no hash, tokens não ficam em memória em texto puro.
+- the router's normalized operation hash,
+- the variables (with sorted object keys),
+- the values of the `key_headers` client request headers (default: `Authorization`).
 
-**Ciclo de vida:** quando o stream upstream termina (todos os clientes saíram, o subgraph mandou `complete`/`error` ou a conexão caiu), o snapshot é descartado. Um stream que está fechando não apaga o snapshot de um stream mais novo com a mesma chave.
+A client only receives a snapshot recorded with the **same** `Authorization` value. Header values only enter the digest, so tokens are never kept in memory in clear text.
 
-O módulo não define prioridade, então roda **depois** dos outros módulos no `SubscriptionOnStart`: se um módulo de autorização rejeitar o cliente, nada é enviado.
+**Lifecycle.** The snapshot is dropped as soon as the upstream stream ends: every client left, the subgraph sent `complete` or `error`, or the connection broke. A stream that is shutting down never removes the snapshot of a newer stream for the same key, and a closed stream can never re-insert one.
 
-## Requisito: SSE entre router e subgraph
+**Ordering.** The module registers with priority `10000` (lower numbers run first), so authorization modules with a lower priority can reject a client in `SubscriptionOnStart` before a snapshot is emitted, and this module sees subgraph responses after other `OnOriginResponse` handlers.
 
-O módulo só observa o protocolo **SSE** no trecho router → subgraph. Com WebSocket upstream, o router multiplexa várias subscriptions numa única conexão, e não há como observá-la de forma segura.
+## Requirement: SSE between router and subgraph
 
-Isso **não** afeta os clientes: eles continuam usando graphql-ws, SSE ou multipart, e o router traduz entre os protocolos.
+The module only observes the **SSE** protocol between the router and the subgraph. Over WebSocket, the router multiplexes many subscriptions over a single connection, which cannot be observed safely.
+
+This does **not** affect clients: they keep using graphql-ws, SSE or multipart, and the router translates between protocols.
 
 ```bash
 npx wgc subgraph publish prices --subscription-protocol sse_post --schema prices.graphql
 ```
 
-Ou, num `graph.yaml` local:
+Or in a local `graph.yaml`:
 
 ```yaml
 subgraphs:
   - name: prices
     routing_url: http://prices:4001/graphql
     subscription:
-      protocol: sse_post   # ou sse (GET)
+      protocol: sse_post   # or sse (GET)
 ```
 
-## Uso
+## Usage
 
-Requer Go 1.26+ (a mesma versão exigida pelo router).
+Requires Go 1.26+ (the version required by the router).
 
 ```bash
 go build -o router ./cmd/router
-cp config.example.yaml config.yaml
+cp config.example.yaml config.yaml   # then add your graph / execution config settings
 GRAPH_API_TOKEN=... ./router
 ```
 
-Com Docker:
+With Docker:
 
 ```bash
-docker build -t router-snapshot .
-docker run -p 3002:3002 -e GRAPH_API_TOKEN=... -e CONFIG_PATH=/config.yaml \
-  -v ./config.yaml:/config.yaml router-snapshot
+docker build \
+  --build-arg TARGETOS=linux --build-arg TARGETARCH=amd64 \
+  --build-arg VERSION=$(git describe --tags --always --dirty) \
+  --build-arg COMMIT=$(git rev-parse HEAD) \
+  --build-arg DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ") \
+  -t router-snapshot .
+
+docker run --rm -p 3002:3002 \
+  -e GRAPH_API_TOKEN=... -e LISTEN_ADDR=0.0.0.0:3002 -e CONFIG_PATH=/config.yaml \
+  -v "$PWD/config.yaml:/config.yaml" router-snapshot
 ```
 
-Se você já tem um router customizado com outros módulos, basta importar o pacote no seu `main.go`:
+If you already build a custom router with other modules, import the package in your `main.go`:
 
 ```go
 import _ "github.com/tpisani/wundergraph-subscriptions-snapshot/snapshot"
 ```
 
-## Configuração
+## Configuration
+
+All options are optional. See [`config.example.yaml`](config.example.yaml).
 
 ```yaml
 modules:
   subscriptionSnapshot:
-    key_headers: [Authorization]   # headers do cliente que entram na chave; [] desliga
-    operations: []                 # nomes de operação com snapshot; vazio = todas
-    ttl: ""                        # descarta snapshots mais velhos; vazio = nunca
-    max_entries: 10000             # limite LRU; 0 = padrão, -1 = sem limite
-    max_event_bytes: 1048576       # maior evento SSE rastreado
+    key_headers: [Authorization]  # client headers that are part of the key; [] disables
+    operations: []                # operation names that get a snapshot; empty = all
+    ttl: ""                       # discard older snapshots (Go duration); empty = never
+    max_entries: 10000            # max stored snapshots (LRU); 0 = default, -1 = unbounded
+    max_total_bytes: 268435456    # max total snapshot size (LRU); 0 = default (256 MiB), -1 = unbounded
+    max_event_bytes: 1048576      # largest SSE event tracked; 0 = default (1 MiB)
 ```
 
-Para isolar por tenant, por exemplo: `key_headers: [Authorization, X-Tenant-Id]`.
+To isolate snapshots per tenant, for example: `key_headers: [Authorization, X-Tenant-Id]`.
 
-## Cuidados
+The router decodes module config without reporting unknown keys, so a misspelled option is silently ignored. The module logs its effective configuration at startup (`subscription snapshot module provisioned`).
 
-- **Os `key_headers` precisam refletir quem pode ver os dados.** Se o subgraph devolve dados diferentes por usuário com base em algo que não está nesses headers (um cookie, por exemplo), inclua esse header na lista.
-- **Cache em memória, por instância.** Cada réplica do router mantém o próprio cache, alimentado pela própria conexão upstream. Uma réplica nova se popula sozinha a partir da primeira mensagem que recebe.
-- **Primeiro cliente.** Quem abre a subscription upstream não recebe snapshot, já que ainda não existe nenhum. O estado inicial desse cliente depende do subgraph emitir um valor ao abrir.
-- **Mensagens só com erro** (sem `data`) não substituem o último estado válido.
-- **Snapshot só passa por quem pode receber.** Clientes com `Authorization` diferente compartilham o mesmo stream upstream (se o router não repassa o header ao subgraph), mas não recebem o snapshot uns dos outros.
+## Security and correctness notes
 
-## Testes
+- **`key_headers` must reflect who is allowed to see the data.** If the subgraph returns per-user data based on something not listed there (a cookie, for example), add that header.
+- **Use `key_headers: []` only for public subscriptions**, whose data is identical for every client.
+- **Deduplication and snapshot keys are independent.** The router deduplicates on the headers it *forwards* to the subgraph; the snapshot key uses the *client* headers listed in `key_headers`. If `Authorization` is not forwarded, clients with different tokens share the upstream stream but never each other's snapshot.
+- **Error-only messages** (no `data`) do not replace the last good state.
+
+## Operational notes
+
+- **In-memory, per router instance.** Every router replica keeps its own snapshots, fed by its own upstream connections, so a new replica fills itself from the first message it receives.
+- **The first client** of a key opens the upstream subscription and gets no snapshot, since none exists yet. Its initial state depends on the subgraph emitting a value when the subscription starts.
+- **Memory** is bounded by `max_entries` and `max_total_bytes`; events larger than `max_event_bytes` stop tracking that stream (a warning is logged) without affecting it.
+- **Logs.** Debug logs report when a stream is tracked, when it stops being tracked and when a snapshot is emitted.
+
+## Development
 
 ```bash
-go test ./...      # unitários
-./e2e/run.sh       # ponta a ponta: router real + subgraph SSE + clientes (requer Node.js para npx wgc)
+go test -race ./...            # unit tests + in-process router integration tests
+./scripts/generate-testdata.sh # regenerate the test router config (requires Node.js)
 ```
 
-O teste de ponta a ponta sobe um subgraph de exemplo que atualiza um preço a cada 4s e verifica que:
-- um cliente que entra no meio recebe o valor atual em milissegundos, tanto via SSE quanto via multipart;
-- um cliente com outro `Authorization` não recebe o snapshot, mesmo compartilhando o mesmo stream upstream;
-- depois que todos saem e o upstream fecha, não sobra snapshot velho.
+The integration tests start the real Cosmo Router in-process, built from a config file through the same `RouterSupervisor` the router binary uses, against an in-process SSE subgraph that only emits a message when the test publishes one. They verify that:
 
-Testado com `github.com/wundergraph/cosmo/router` na versão `router@0.362.0`. Como o módulo é compilado junto com o router e depende de como a engine lê o stream SSE, rode os testes a cada upgrade do router.
+- a late subscriber receives the current state immediately, over SSE and multipart, and then live updates without duplicates;
+- a client with another `Authorization`, an anonymous client or a client with other arguments (variables or inline literals) never receives the snapshot, even when sharing the upstream stream;
+- no stale snapshot is served after the upstream stream closes;
+- with `key_headers: []`, every client shares the snapshot.
+
+## Compatibility and upgrades
+
+Built and tested against `github.com/wundergraph/cosmo/router` at `router@0.362.0`. Custom modules are compiled into the router binary, so every router upgrade requires a rebuild:
+
+```bash
+go get github.com/wundergraph/cosmo/router@<commit-sha-of-the-release>
+go mod tidy
+go test -race ./...
+```
+
+The module mirrors how the engine parses the SSE stream from the subgraph, so always run the tests when upgrading the router. Router releases are listed on the [Cosmo releases page](https://github.com/wundergraph/cosmo/releases?q=router%40&expanded=false).
+
+## References
+
+- [Cosmo Router custom modules](https://cosmo-docs.wundergraph.com/router/custom-modules)
+- [SubscriptionOnStart handler](https://cosmo-docs.wundergraph.com/router/cosmo-streams/custom-modules/subscription-on-start)
+- [Router subscriptions](https://cosmo-docs.wundergraph.com/router/subscriptions)
+- [wundergraph/router-examples](https://github.com/wundergraph/router-examples)

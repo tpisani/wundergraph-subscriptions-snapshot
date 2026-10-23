@@ -1,0 +1,10 @@
+# Input for scripts/generate-testdata.sh. The routing URL is a placeholder that
+# the integration test replaces with the address of its in-process subgraph.
+version: 1
+subgraphs:
+  - name: prices
+    routing_url: http://subgraph.invalid/graphql
+    schema:
+      file: ./prices.graphql
+    subscription:
+      protocol: sse_post

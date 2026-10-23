@@ -11,8 +11,8 @@
 //     remembers the last data message per subscription key, without altering
 //     the stream;
 //  2. emits that message to each new client right when it subscribes
-//     (SubscriptionOnStart). The engine treats it exactly like a message from
-//     the subgraph and resolves the client's own selection set.
+//     (SubscriptionOnStartHandler). The engine treats it exactly like a
+//     message from the subgraph and resolves the client's own selection set.
 //
 // The subscription key is: normalized operation hash + variables + values of
 // the configured identity headers (default: Authorization).
@@ -38,9 +38,16 @@ import (
 // ModuleID is the key used under `modules:` in the router config.yaml.
 const ModuleID = "subscriptionSnapshot"
 
+// ModulePriority places this module after typical authorization modules
+// (lower numbers run first), so their SubscriptionOnStart hooks can reject a
+// client before a snapshot is emitted to it, and so this module observes the
+// subgraph response after other OnOriginResponse handlers have run.
+const ModulePriority = 10_000
+
 const (
 	defaultMaxEntries    = 10_000
-	defaultMaxEventBytes = 1 << 20 // 1 MiB
+	defaultMaxTotalBytes = 256 << 20 // 256 MiB
+	defaultMaxEventBytes = 1 << 20   // 1 MiB
 )
 
 var defaultKeyHeaders = []string{"Authorization"}
@@ -51,21 +58,34 @@ func init() {
 
 // Module is the subscription snapshot custom module.
 //
-// Config (all optional), decoded from `modules.subscriptionSnapshot`:
+// Configuration is decoded by the router from `modules.subscriptionSnapshot`
+// in config.yaml. All fields are optional:
 //
 //	modules:
 //	  subscriptionSnapshot:
-//	    key_headers: ["Authorization"] # client headers that identify who sees the data
+//	    key_headers: ["Authorization"] # client headers that identify who may see a snapshot
 //	    operations: ["OnPriceChanged"] # operation names to snapshot; empty = all subscriptions
 //	    ttl: "10m"                     # discard snapshots older than this; empty/"0" = never
-//	    max_entries: 10000             # LRU bound; 0 = default (10000), -1 = unbounded
+//	    max_entries: 10000             # max stored snapshots; 0 = default, -1 = unbounded
+//	    max_total_bytes: 268435456     # max total snapshot size; 0 = default (256 MiB), -1 = unbounded
 //	    max_event_bytes: 1048576       # largest SSE event tracked; 0 = default (1 MiB)
 type Module struct {
-	KeyHeaders    []string `mapstructure:"key_headers"`
-	Operations    []string `mapstructure:"operations"`
-	TTL           string   `mapstructure:"ttl"`
-	MaxEntries    int      `mapstructure:"max_entries"`
-	MaxEventBytes int      `mapstructure:"max_event_bytes"`
+	// KeyHeaders lists the client request headers whose values are part of the
+	// snapshot key. Nil (not configured) defaults to [Authorization]; an
+	// explicit empty list disables header keys.
+	KeyHeaders []string `mapstructure:"key_headers"`
+	// Operations restricts snapshots to these operation names. Empty = all.
+	Operations []string `mapstructure:"operations"`
+	// TTL is a Go duration string. The router decodes module config without
+	// decode hooks, so durations are taken as strings and parsed in Provision.
+	TTL string `mapstructure:"ttl"`
+	// MaxEntries bounds the number of stored snapshots (LRU eviction).
+	MaxEntries int `mapstructure:"max_entries"`
+	// MaxTotalBytes bounds the total size of stored snapshots (LRU eviction).
+	MaxTotalBytes int `mapstructure:"max_total_bytes"`
+	// MaxEventBytes is the largest SSE event that is tracked. A larger event
+	// stops tracking that stream; the stream itself is not affected.
+	MaxEventBytes int `mapstructure:"max_event_bytes"`
 
 	keyHeaders []string
 	operations map[string]struct{}
@@ -74,19 +94,18 @@ type Module struct {
 	logger     *zap.Logger
 }
 
+// Module returns the registration info of the module.
 func (m *Module) Module() core.ModuleInfo {
 	return core.ModuleInfo{
-		ID: ModuleID,
-		// No priority on purpose: modules without one run last, so an
-		// authorization module's SubscriptionOnStart can reject the client
-		// before the snapshot is emitted.
+		ID:       ModuleID,
+		Priority: ModulePriority,
 		New: func() core.Module {
 			return &Module{}
 		},
 	}
 }
 
-// Provision validates the config and initializes the store.
+// Provision validates the configuration and initializes the store.
 func (m *Module) Provision(ctx *core.ModuleContext) error {
 	m.logger = ctx.Logger
 	if m.logger == nil {
@@ -105,9 +124,13 @@ func (m *Module) Provision(ctx *core.ModuleContext) error {
 		ttl = d
 	}
 
-	maxEntries := m.MaxEntries
-	if maxEntries == 0 {
-		maxEntries = defaultMaxEntries
+	maxEntries, err := limit("max_entries", m.MaxEntries, defaultMaxEntries)
+	if err != nil {
+		return err
+	}
+	maxTotalBytes, err := limit("max_total_bytes", m.MaxTotalBytes, defaultMaxTotalBytes)
+	if err != nil {
+		return err
 	}
 	if m.MaxEventBytes < 0 {
 		return fmt.Errorf("%s: max_event_bytes must not be negative", ModuleID)
@@ -116,7 +139,6 @@ func (m *Module) Provision(ctx *core.ModuleContext) error {
 		m.MaxEventBytes = defaultMaxEventBytes
 	}
 
-	// nil (not configured) => default; an explicit empty list is respected.
 	headers := m.KeyHeaders
 	if headers == nil {
 		headers = defaultKeyHeaders
@@ -132,7 +154,7 @@ func (m *Module) Provision(ctx *core.ModuleContext) error {
 	slices.Sort(m.keyHeaders)
 	m.keyHeaders = slices.Compact(m.keyHeaders)
 	if len(m.keyHeaders) == 0 {
-		m.logger.Warn("subscription snapshot: no key_headers configured; snapshots are shared by every client with the same operation and variables")
+		m.logger.Warn("no key_headers configured: snapshots are shared by every client with the same operation and variables")
 	}
 
 	m.operations = make(map[string]struct{}, len(m.Operations))
@@ -140,21 +162,33 @@ func (m *Module) Provision(ctx *core.ModuleContext) error {
 		m.operations[op] = struct{}{}
 	}
 
-	m.store = newStore(maxEntries, ttl)
+	m.store = newStore(maxEntries, maxTotalBytes, ttl)
 
 	m.logger.Info("subscription snapshot module provisioned",
 		zap.Strings("key_headers", m.keyHeaders),
 		zap.Strings("operations", m.Operations),
 		zap.Duration("ttl", ttl),
 		zap.Int("max_entries", maxEntries),
+		zap.Int("max_total_bytes", maxTotalBytes),
 		zap.Int("max_event_bytes", m.MaxEventBytes),
 	)
 	return nil
 }
 
+// Cleanup releases the stored snapshots when the router shuts down.
+func (m *Module) Cleanup() error {
+	if m.store != nil {
+		m.store.Reset()
+	}
+	return nil
+}
+
 // OnOriginResponse attaches a tap to router -> subgraph SSE subscription
-// streams. The response is modified in place (only its Body is wrapped) and
-// nil is returned so other modules' handlers keep running.
+// streams. Only the response Body is wrapped; nil is returned so that the
+// response continues through the remaining handlers unchanged.
+//
+// This handler only reads from ctx, so it is safe when an operation fans out
+// to several subgraphs concurrently.
 func (m *Module) OnOriginResponse(resp *http.Response, ctx core.RequestContext) *http.Response {
 	if resp == nil || resp.Body == nil || resp.StatusCode != http.StatusOK || ctx == nil {
 		return nil
@@ -169,9 +203,23 @@ func (m *Module) OnOriginResponse(resp *http.Response, ctx core.RequestContext) 
 	}
 
 	owner := m.streamSeq.Add(1)
+	logger := ctx.Logger()
+	if logger == nil {
+		logger = m.logger
+	}
+	logger = logger.With(zap.String("component", ModuleID), zap.Uint64("stream", owner))
+	logger.Debug("tracking upstream subscription stream")
+
 	resp.Body = newSSETap(resp.Body, m.MaxEventBytes,
 		func(payload []byte) { m.store.Set(key, owner, payload) },
-		func() { m.store.DeleteOwned(key, owner) },
+		func(reason string) {
+			m.store.DeleteOwned(key, owner)
+			if reason == endEventTooLarge {
+				logger.Warn("stopped tracking upstream subscription stream", zap.String("reason", reason), zap.Int("max_event_bytes", m.MaxEventBytes))
+				return
+			}
+			logger.Debug("stopped tracking upstream subscription stream", zap.String("reason", reason))
+		},
 	)
 	return nil
 }
@@ -195,10 +243,15 @@ func (m *Module) SubscriptionOnStart(ctx core.SubscriptionOnStartHandlerContext)
 		return nil
 	}
 
+	logger := ctx.Logger()
 	if !ctx.EmitEvent(ctx.NewEvent(data)) {
-		if l := ctx.Logger(); l != nil {
-			l.Warn("subscription snapshot was dropped")
+		if logger != nil {
+			logger.Warn("subscription snapshot was dropped", zap.String("component", ModuleID))
 		}
+		return nil
+	}
+	if logger != nil {
+		logger.Debug("subscription snapshot emitted", zap.String("component", ModuleID), zap.Int("bytes", len(data)))
 	}
 	return nil
 }
@@ -226,6 +279,21 @@ func (m *Module) keyFor(op core.OperationContext, req *http.Request) (string, bo
 	return subscriptionKey(op.Hash(), variables, header, m.keyHeaders), true
 }
 
+// limit applies the shared semantics of size limits: 0 = default, -1 =
+// unbounded, other negative values are invalid.
+func limit(name string, value, def int) (int, error) {
+	switch {
+	case value == 0:
+		return def, nil
+	case value == -1:
+		return 0, nil
+	case value < 0:
+		return 0, fmt.Errorf("%s: %s must be -1 (unbounded), 0 (default) or positive", ModuleID, name)
+	default:
+		return value, nil
+	}
+}
+
 func isEventStream(contentType string) bool {
 	if contentType == "" {
 		return false
@@ -238,6 +306,7 @@ func isEventStream(contentType string) bool {
 var (
 	_ core.Module                     = (*Module)(nil)
 	_ core.Provisioner                = (*Module)(nil)
+	_ core.Cleaner                    = (*Module)(nil)
 	_ core.EnginePostOriginHandler    = (*Module)(nil)
 	_ core.SubscriptionOnStartHandler = (*Module)(nil)
 )

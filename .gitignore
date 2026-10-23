@@ -2,5 +2,3 @@
 /bin/
 .env
 /config.yaml
-e2e/bin/
-e2e/out/

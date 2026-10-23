@@ -17,6 +17,15 @@ type executionResult struct {
 	Extensions json.RawMessage `json:"extensions,omitempty"`
 }
 
+// Reasons passed to onEnd.
+const (
+	endEventTooLarge = "event exceeds max_event_bytes"
+	endUpstreamEOF   = "upstream stream ended"
+	endClosed        = "upstream stream closed"
+	endComplete      = "upstream sent complete"
+	endError         = "upstream sent error"
+)
+
 var (
 	headerData  = []byte("data:")
 	headerEvent = []byte("event:")
@@ -26,66 +35,79 @@ var (
 // the engine unchanged and, on the side, splits the stream into events with
 // the same rules as the engine (r3labs/sse delimiters + graphql-go-tools event
 // parsing) to report the latest data payload.
+//
+// The engine reads the body from one goroutine and may Close it from another
+// one when the subscription ends, so all tap state is guarded by mu. onData
+// and onEnd are invoked while mu is held: once onEnd has run, onData is never
+// called again, which guarantees a closed stream cannot re-insert a snapshot.
 type sseTap struct {
-	body    io.ReadCloser
-	buf     []byte
-	maxBuf  int
-	broken  bool
-	onData  func(payload []byte)
-	onEnd   func()
-	endOnce sync.Once
+	body   io.ReadCloser
+	maxBuf int
+	onData func(payload []byte)
+	onEnd  func(reason string)
+
+	mu    sync.Mutex
+	buf   []byte
+	ended bool
 }
 
-func newSSETap(body io.ReadCloser, maxBuf int, onData func([]byte), onEnd func()) *sseTap {
+func newSSETap(body io.ReadCloser, maxBuf int, onData func([]byte), onEnd func(reason string)) *sseTap {
 	return &sseTap{body: body, maxBuf: maxBuf, onData: onData, onEnd: onEnd}
 }
 
 func (t *sseTap) Read(p []byte) (int, error) {
 	n, err := t.body.Read(p)
-	if n > 0 && !t.broken {
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if n > 0 && !t.ended {
 		t.buf = append(t.buf, p[:n]...)
-		t.drain()
-		if !t.broken && t.maxBuf > 0 && len(t.buf) > t.maxBuf {
+		t.drainLocked()
+		if !t.ended && t.maxBuf > 0 && len(t.buf) > t.maxBuf {
 			// An event larger than we are willing to buffer: stop tracking this
 			// stream and drop its snapshot so it can never go stale.
-			t.broken = true
-			t.buf = nil
-			t.end()
+			t.endLocked(endEventTooLarge)
 		}
 	}
 	if err != nil {
-		t.end()
+		t.endLocked(endUpstreamEOF)
 	}
 	return n, err
 }
 
 func (t *sseTap) Close() error {
 	err := t.body.Close()
-	t.end()
+
+	t.mu.Lock()
+	t.endLocked(endClosed)
+	t.mu.Unlock()
+
 	return err
 }
 
-func (t *sseTap) end() {
-	t.endOnce.Do(func() {
-		t.broken = true
-		t.buf = nil
-		if t.onEnd != nil {
-			t.onEnd()
-		}
-	})
+func (t *sseTap) endLocked(reason string) {
+	if t.ended {
+		return
+	}
+	t.ended = true
+	t.buf = nil
+	if t.onEnd != nil {
+		t.onEnd(reason)
+	}
 }
 
-// drain extracts and handles every complete event currently in the buffer.
-func (t *sseTap) drain() {
-	for !t.broken {
+// drainLocked extracts and handles every complete event currently buffered.
+func (t *sseTap) drainLocked() {
+	for !t.ended {
 		i, nlen := containsDoubleNewline(t.buf)
 		if i < 0 {
-			return
+			break
 		}
 		event, rest := t.buf[:i], t.buf[i+nlen:]
-		t.handleEvent(event)
-		if t.broken {
-			return // handleEvent ended the stream and released the buffer
+		t.handleEventLocked(event)
+		if t.ended {
+			return // the event ended the stream and released the buffer
 		}
 		t.buf = rest
 	}
@@ -94,23 +116,24 @@ func (t *sseTap) drain() {
 	}
 }
 
-func (t *sseTap) handleEvent(raw []byte) {
+func (t *sseTap) handleEventLocked(raw []byte) {
 	eventType, data := parseEventBytes(raw)
 	switch eventType {
-	case "complete", "error":
-		// The upstream subscription is finished; its snapshot is no longer live.
-		t.end()
+	case "complete":
+		t.endLocked(endComplete)
+	case "error":
+		t.endLocked(endError)
 	case "next", "":
 		if eventType == "" && data == nil {
 			return // keep-alive / comment
 		}
 		if len(data) == 0 {
-			t.end() // the engine treats an empty untyped event as complete
+			t.endLocked(endComplete) // the engine treats an empty untyped event as complete
 			return
 		}
 		var res executionResult
 		if err := json.Unmarshal(data, &res); err != nil {
-			return // the engine will surface this as an error; nothing to cache
+			return // the engine surfaces this as an error; nothing to cache
 		}
 		if len(res.Data) == 0 || bytes.Equal(bytes.TrimSpace(res.Data), []byte("null")) {
 			return // keep the previous good state instead of an error-only payload
@@ -123,7 +146,8 @@ func (t *sseTap) handleEvent(raw []byte) {
 	}
 }
 
-// parseEventBytes is a copy of the engine's SSE event parsing.
+// parseEventBytes is a copy of the engine's SSE event parsing
+// (graphql-go-tools subscriptionclient/transport/sse_conn.go).
 func parseEventBytes(msg []byte) (eventType string, data []byte) {
 	if len(msg) == 0 {
 		return "", nil
@@ -155,7 +179,8 @@ func trimHeader(size int, data []byte) []byte {
 	return data
 }
 
-// containsDoubleNewline is a copy of r3labs/sse's event delimiter detection.
+// containsDoubleNewline is a copy of r3labs/sse's event delimiter detection,
+// which the engine uses to split the stream into events.
 func containsDoubleNewline(data []byte) (int, int) {
 	crcr := bytes.Index(data, []byte("\r\r"))
 	lflf := bytes.Index(data, []byte("\n\n"))

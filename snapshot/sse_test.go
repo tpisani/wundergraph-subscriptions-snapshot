@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -37,7 +38,7 @@ func (r *recorder) tap(stream string, chunk, maxBuf int) (*sseTap, *chunkReader)
 	body := &chunkReader{data: []byte(stream), size: chunk}
 	return newSSETap(body, maxBuf,
 		func(p []byte) { r.payloads = append(r.payloads, string(p)) },
-		func() { r.ended++ },
+		func(string) { r.ended++ },
 	), body
 }
 
@@ -162,5 +163,55 @@ func TestTapStopsTrackingOversizedEvents(t *testing.T) {
 	}
 	if len(r.payloads) != 1 {
 		t.Fatalf("nothing after the oversized event should be recorded, got %q", r.payloads)
+	}
+}
+
+const sampleEvent = "event: next\ndata: {\"data\":{\"a\":1}}\n\n"
+
+// endlessStream is an upstream that never ends, producing sampleEvent forever.
+type endlessStream struct{ off int }
+
+func (e *endlessStream) Read(p []byte) (int, error) {
+	n := 0
+	for n < len(p) {
+		c := copy(p[n:], sampleEvent[e.off:])
+		n += c
+		e.off = (e.off + c) % len(sampleEvent)
+	}
+	return n, nil
+}
+
+func (e *endlessStream) Close() error { return nil }
+
+// The engine reads the body from one goroutine and may close it from another
+// one. Once Close returns, no snapshot may survive (run with -race).
+func TestTapCloseWhileReading(t *testing.T) {
+	for i := 0; i < 200; i++ {
+		s := newStore(10, 0, 0)
+		first := make(chan struct{})
+		var once sync.Once
+		tap := newSSETap(&endlessStream{}, 1<<20,
+			func(p []byte) { s.Set("k", 1, p); once.Do(func() { close(first) }) },
+			func(string) { s.DeleteOwned("k", 1) },
+		)
+
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			buf := make([]byte, 7)
+			for j := 0; j < 1000; j++ {
+				_, _ = tap.Read(buf)
+			}
+		}()
+
+		<-first
+		if err := tap.Close(); err != nil {
+			t.Fatal(err)
+		}
+		<-done
+
+		if _, ok := s.Get("k"); ok {
+			t.Fatalf("run %d: snapshot survived Close", i)
+		}
 	}
 }

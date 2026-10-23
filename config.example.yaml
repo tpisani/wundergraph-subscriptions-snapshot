@@ -1,16 +1,19 @@
 # yaml-language-server: $schema=https://raw.githubusercontent.com/wundergraph/cosmo/main/router/pkg/config/config.schema.json
 version: "1"
 
-# The subgraphs that serve subscriptions must use SSE towards the router:
+# Subgraphs that serve subscriptions must use SSE towards the router:
 #   npx wgc subgraph publish prices --subscription-protocol sse_post ...
 # (or `subscription: { protocol: sse_post }` in a local graph.yaml).
 # Clients can keep using graphql-ws, SSE or multipart.
 
+# Never put secrets in this file in plain text; use environment variables.
+
 modules:
   subscriptionSnapshot:
-    # Client headers that identify who may see a snapshot. Clients only receive
-    # a snapshot recorded for the same operation, variables AND these header
-    # values. Default: [Authorization]. An explicit [] disables header keys.
+    # Client request headers that identify who may see a snapshot. A client only
+    # receives a snapshot recorded for the same operation, variables AND values
+    # of these headers. Default: [Authorization]. An explicit [] disables header
+    # keys (only for subscriptions whose data is identical for every client).
     key_headers:
       - Authorization
       # - X-Tenant-Id
@@ -19,9 +22,11 @@ modules:
     # Discard snapshots older than this (Go duration). Empty or "0" = never.
     # Snapshots are always dropped when the upstream stream ends.
     ttl: ""
-    # Max number of distinct subscriptions kept in memory (LRU).
-    # 0 = default (10000), -1 = unbounded.
+    # Maximum number of stored snapshots (LRU). 0 = default (10000), -1 = unbounded.
     max_entries: 10000
-    # Largest SSE event tracked; bigger events stop tracking that stream.
-    # 0 = default (1 MiB).
+    # Maximum total size of stored snapshots in bytes (LRU).
+    # 0 = default (256 MiB), -1 = unbounded.
+    max_total_bytes: 268435456
+    # Largest SSE event that is tracked; a larger event stops tracking that
+    # stream (the stream itself is not affected). 0 = default (1 MiB).
     max_event_bytes: 1048576

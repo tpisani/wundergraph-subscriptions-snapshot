@@ -44,6 +44,7 @@ type fakeReqCtx struct {
 
 func (c *fakeReqCtx) Operation() core.OperationContext { return c.op }
 func (c *fakeReqCtx) Request() *http.Request           { return c.req }
+func (c *fakeReqCtx) Logger() *zap.Logger              { return zap.NewNop() }
 
 type fakeEvent struct{ data []byte }
 
@@ -217,11 +218,15 @@ func TestConfigDecoding(t *testing.T) {
 		"ttl":             "5m",
 		"max_entries":     5,
 		"max_event_bytes": 2048,
+		"max_total_bytes": -1,
 	}, m)
 	if err != nil {
 		t.Fatal(err)
 	}
 	provisioned(t, m)
+	if m.store.maxEntries != 5 || m.store.maxBytes != 0 || m.MaxEventBytes != 2048 || m.store.ttl.String() != "5m0s" {
+		t.Fatalf("limits not applied: entries=%d bytes=%d event=%d ttl=%s", m.store.maxEntries, m.store.maxBytes, m.MaxEventBytes, m.store.ttl)
+	}
 	if strings.Join(m.keyHeaders, ",") != "Authorization,X-Tenant-Id" {
 		t.Fatalf("headers must be canonicalized, sorted and deduplicated: %v", m.keyHeaders)
 	}
@@ -242,9 +247,47 @@ func TestConfigDecoding(t *testing.T) {
 }
 
 func TestInvalidConfig(t *testing.T) {
-	for _, m := range []*Module{{TTL: "banana"}, {TTL: "-1s"}, {MaxEventBytes: -1}} {
+	for _, m := range []*Module{{TTL: "banana"}, {TTL: "-1s"}, {MaxEventBytes: -1}, {MaxEntries: -2}, {MaxTotalBytes: -5}} {
 		if err := m.Provision(&core.ModuleContext{Context: context.Background(), Module: m, Logger: zap.NewNop()}); err == nil {
 			t.Fatalf("expected error for %+v", m)
 		}
+	}
+}
+
+func TestModuleInfo(t *testing.T) {
+	info := (&Module{}).Module()
+	if info.ID != ModuleID {
+		t.Fatalf("unexpected module id %q", info.ID)
+	}
+	if info.Priority <= 0 {
+		t.Fatal("priority must be greater than 0")
+	}
+	if _, ok := info.New().(*Module); !ok {
+		t.Fatal("New must return a fresh *Module")
+	}
+}
+
+func TestDefaults(t *testing.T) {
+	m := provisioned(t, &Module{})
+	if m.store.maxEntries != defaultMaxEntries || m.store.maxBytes != defaultMaxTotalBytes || m.MaxEventBytes != defaultMaxEventBytes || m.store.ttl != 0 {
+		t.Fatalf("unexpected defaults: entries=%d bytes=%d event=%d ttl=%s", m.store.maxEntries, m.store.maxBytes, m.MaxEventBytes, m.store.ttl)
+	}
+}
+
+func TestCleanupDropsSnapshots(t *testing.T) {
+	m := provisioned(t, &Module{})
+	resp := upstream(t, m, priceOp, "", "event: next\ndata: {\"data\":{\"a\":1}}\n\n")
+	_, _ = resp.Body.Read(make([]byte, 64))
+	if m.store.Len() != 1 {
+		t.Fatal("expected a stored snapshot")
+	}
+	if err := m.Cleanup(); err != nil {
+		t.Fatal(err)
+	}
+	if m.store.Len() != 0 {
+		t.Fatal("cleanup must drop stored snapshots")
+	}
+	if err := (&Module{}).Cleanup(); err != nil {
+		t.Fatal("cleanup on an unprovisioned module must not fail")
 	}
 }
