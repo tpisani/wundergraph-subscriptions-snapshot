@@ -1,37 +1,49 @@
 // Package snapshot provides a Cosmo Router custom module that replays the
-// latest event of a Cosmo Streams (EDFS) subscription to every new subscriber.
+// latest message of a subgraph-served GraphQL subscription to every new
+// subscriber, even when the router deduplicates upstream subscriptions.
 //
-// The router deduplicates EDFS subscriptions: all clients subscribed to the same
-// provider + subjects/topics/channels share a single broker subscription. A
-// client that joins later only receives future events. This module remembers
-// the last event delivered on each broker subscription (via the
-// BeforeEventsDispatch hook, which runs once per batch, not once per
-// subscriber) and emits it to each new client right when it subscribes (via
-// the SubscriptionOnStart hook).
+// With deduplication, all clients subscribed with the same operation,
+// variables and forwarded headers share one upstream subscription to the
+// subgraph. A client that joins later only receives future messages. This
+// module:
 //
-// Since EDFS events usually carry only the entity key, the router resolves all
-// requested fields from the subgraphs when the snapshot is emitted, so clients
-// receive fresh data.
+//  1. watches the router -> subgraph SSE stream (EnginePostOriginHandler) and
+//     remembers the last data message per subscription key, without altering
+//     the stream;
+//  2. emits that message to each new client right when it subscribes
+//     (SubscriptionOnStart). The engine treats it exactly like a message from
+//     the subgraph and resolves the client's own selection set.
+//
+// The subscription key is: normalized operation hash + variables + values of
+// the configured identity headers (default: Authorization).
+//
+// Only the SSE protocol between router and subgraph is supported (configure
+// the subgraph with `--subscription-protocol sse` or `sse_post`). Clients can
+// still use any protocol the router accepts (graphql-ws, SSE, multipart, ...).
 package snapshot
 
 import (
 	"fmt"
+	"mime"
+	"net/http"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/wundergraph/cosmo/router/core"
-	"github.com/wundergraph/cosmo/router/pkg/pubsub/datasource"
-	"github.com/wundergraph/cosmo/router/pkg/pubsub/kafka"
-	"github.com/wundergraph/cosmo/router/pkg/pubsub/nats"
-	"github.com/wundergraph/cosmo/router/pkg/pubsub/redis"
 	"go.uber.org/zap"
 )
 
 // ModuleID is the key used under `modules:` in the router config.yaml.
 const ModuleID = "subscriptionSnapshot"
 
-const defaultMaxEntries = 10_000
+const (
+	defaultMaxEntries    = 10_000
+	defaultMaxEventBytes = 1 << 20 // 1 MiB
+)
+
+var defaultKeyHeaders = []string{"Authorization"}
 
 func init() {
 	core.RegisterModule(&Module{})
@@ -39,27 +51,33 @@ func init() {
 
 // Module is the subscription snapshot custom module.
 //
-// Config (all optional), decoded from `modules.subscriptionSnapshot` in config.yaml:
+// Config (all optional), decoded from `modules.subscriptionSnapshot`:
 //
 //	modules:
 //	  subscriptionSnapshot:
-//	    fields: ["employeeUpdated"] # root subscription fields to snapshot; empty = all EDFS subscriptions
-//	    ttl: "10m"                  # discard snapshots older than this; empty/"0" = never
-//	    max_entries: 10000          # LRU bound on stored snapshots; 0 = default (10000), -1 = unbounded
+//	    key_headers: ["Authorization"] # client headers that identify who sees the data
+//	    operations: ["OnPriceChanged"] # operation names to snapshot; empty = all subscriptions
+//	    ttl: "10m"                     # discard snapshots older than this; empty/"0" = never
+//	    max_entries: 10000             # LRU bound; 0 = default (10000), -1 = unbounded
+//	    max_event_bytes: 1048576       # largest SSE event tracked; 0 = default (1 MiB)
 type Module struct {
-	Fields     []string `mapstructure:"fields"`
-	TTL        string   `mapstructure:"ttl"`
-	MaxEntries int      `mapstructure:"max_entries"`
+	KeyHeaders    []string `mapstructure:"key_headers"`
+	Operations    []string `mapstructure:"operations"`
+	TTL           string   `mapstructure:"ttl"`
+	MaxEntries    int      `mapstructure:"max_entries"`
+	MaxEventBytes int      `mapstructure:"max_event_bytes"`
 
-	fields map[string]struct{}
-	store  *store
-	logger *zap.Logger
+	keyHeaders []string
+	operations map[string]struct{}
+	store      *store
+	streamSeq  atomic.Uint64
+	logger     *zap.Logger
 }
 
 func (m *Module) Module() core.ModuleInfo {
 	return core.ModuleInfo{
 		ID: ModuleID,
-		// No priority on purpose: modules without one run last, so any
+		// No priority on purpose: modules without one run last, so an
 		// authorization module's SubscriptionOnStart can reject the client
 		// before the snapshot is emitted.
 		New: func() core.Module {
@@ -71,6 +89,9 @@ func (m *Module) Module() core.ModuleInfo {
 // Provision validates the config and initializes the store.
 func (m *Module) Provision(ctx *core.ModuleContext) error {
 	m.logger = ctx.Logger
+	if m.logger == nil {
+		m.logger = zap.NewNop()
+	}
 
 	var ttl time.Duration
 	if m.TTL != "" && m.TTL != "0" {
@@ -88,51 +109,83 @@ func (m *Module) Provision(ctx *core.ModuleContext) error {
 	if maxEntries == 0 {
 		maxEntries = defaultMaxEntries
 	}
+	if m.MaxEventBytes < 0 {
+		return fmt.Errorf("%s: max_event_bytes must not be negative", ModuleID)
+	}
+	if m.MaxEventBytes == 0 {
+		m.MaxEventBytes = defaultMaxEventBytes
+	}
 
-	m.fields = make(map[string]struct{}, len(m.Fields))
-	for _, f := range m.Fields {
-		m.fields[f] = struct{}{}
+	// nil (not configured) => default; an explicit empty list is respected.
+	headers := m.KeyHeaders
+	if headers == nil {
+		headers = defaultKeyHeaders
+	}
+	m.keyHeaders = make([]string, 0, len(headers))
+	for _, h := range headers {
+		h = strings.TrimSpace(h)
+		if h == "" {
+			continue
+		}
+		m.keyHeaders = append(m.keyHeaders, http.CanonicalHeaderKey(h))
+	}
+	slices.Sort(m.keyHeaders)
+	m.keyHeaders = slices.Compact(m.keyHeaders)
+	if len(m.keyHeaders) == 0 {
+		m.logger.Warn("subscription snapshot: no key_headers configured; snapshots are shared by every client with the same operation and variables")
+	}
+
+	m.operations = make(map[string]struct{}, len(m.Operations))
+	for _, op := range m.Operations {
+		m.operations[op] = struct{}{}
 	}
 
 	m.store = newStore(maxEntries, ttl)
 
 	m.logger.Info("subscription snapshot module provisioned",
-		zap.Strings("fields", m.Fields),
+		zap.Strings("key_headers", m.keyHeaders),
+		zap.Strings("operations", m.Operations),
 		zap.Duration("ttl", ttl),
 		zap.Int("max_entries", maxEntries),
+		zap.Int("max_event_bytes", m.MaxEventBytes),
 	)
 	return nil
 }
 
-// BeforeEventsDispatch runs once per batch received from the broker and records
-// the last event of the batch. Events are passed through unchanged.
-func (m *Module) BeforeEventsDispatch(ctx core.StreamBeforeEventsDispatchHandlerContext, events datasource.StreamEvents) (datasource.StreamEvents, error) {
-	key, ok := m.keyFor(ctx.SubscriptionEventConfiguration())
+// OnOriginResponse attaches a tap to router -> subgraph SSE subscription
+// streams. The response is modified in place (only its Body is wrapped) and
+// nil is returned so other modules' handlers keep running.
+func (m *Module) OnOriginResponse(resp *http.Response, ctx core.RequestContext) *http.Response {
+	if resp == nil || resp.Body == nil || resp.StatusCode != http.StatusOK || ctx == nil {
+		return nil
+	}
+	if !isEventStream(resp.Header.Get("Content-Type")) {
+		return nil
+	}
+
+	key, ok := m.keyFor(ctx.Operation(), ctx.Request())
 	if !ok {
-		return events, nil
+		return nil
 	}
 
-	var last []byte
-	for _, evt := range events.All() {
-		if evt == nil {
-			continue
-		}
-		if data := evt.GetData(); len(data) > 0 {
-			last = data
-		}
-	}
-	if last != nil {
-		m.store.Set(key, last)
-	}
-
-	return events, nil
+	owner := m.streamSeq.Add(1)
+	resp.Body = newSSETap(resp.Body, m.MaxEventBytes,
+		func(payload []byte) { m.store.Set(key, owner, payload) },
+		func() { m.store.DeleteOwned(key, owner) },
+	)
+	return nil
 }
 
 // SubscriptionOnStart emits the stored snapshot (if any) to the client that is
 // subscribing right now. Other subscribers are not affected.
 func (m *Module) SubscriptionOnStart(ctx core.SubscriptionOnStartHandlerContext) error {
-	// Engine (non-EDFS) subscriptions have no event configuration; skip them.
-	key, ok := m.keyFor(ctx.SubscriptionEventConfiguration())
+	// Cosmo Streams (EDFS) subscriptions carry an event configuration; this
+	// module only handles subgraph-served subscriptions.
+	if ctx.SubscriptionEventConfiguration() != nil {
+		return nil
+	}
+
+	key, ok := m.keyFor(ctx.Operation(), ctx.Request())
 	if !ok {
 		return nil
 	}
@@ -143,49 +196,48 @@ func (m *Module) SubscriptionOnStart(ctx core.SubscriptionOnStartHandlerContext)
 	}
 
 	if !ctx.EmitEvent(ctx.NewEvent(data)) {
-		ctx.Logger().Warn("subscription snapshot was dropped", zap.String("key", key))
+		if l := ctx.Logger(); l != nil {
+			l.Warn("subscription snapshot was dropped")
+		}
 	}
 	return nil
 }
 
-// keyFor builds a stable cache key matching the broker subscription the router
-// deduplicates on: provider type + provider id + sorted subjects/topics/channels.
-// Subjects are already interpolated with the operation arguments at this point.
-func (m *Module) keyFor(cfg datasource.SubscriptionEventConfiguration) (string, bool) {
-	if cfg == nil || m.store == nil {
+func (m *Module) keyFor(op core.OperationContext, req *http.Request) (string, bool) {
+	if m.store == nil || op == nil || op.Type() != "subscription" {
 		return "", false
 	}
-	if len(m.fields) > 0 {
-		if _, ok := m.fields[cfg.RootFieldName()]; !ok {
+	if len(m.operations) > 0 {
+		if _, ok := m.operations[op.Name()]; !ok {
 			return "", false
 		}
 	}
 
-	var targets []string
-	switch c := cfg.(type) {
-	case *nats.SubscriptionEventConfiguration:
-		targets = c.Subjects
-	case *kafka.SubscriptionEventConfiguration:
-		targets = c.Topics
-	case *redis.SubscriptionEventConfiguration:
-		targets = c.Channels
-	default:
-		return "", false
-	}
-	if len(targets) == 0 {
-		return "", false
+	var variables []byte
+	if v := op.Variables(); v != nil {
+		variables = v.MarshalTo(nil)
 	}
 
-	sorted := slices.Clone(targets)
-	slices.Sort(sorted)
+	var header http.Header
+	if req != nil {
+		header = req.Header
+	}
 
-	return string(cfg.ProviderType()) + "|" + cfg.ProviderID() + "|" + strings.Join(sorted, ","), true
+	return subscriptionKey(op.Hash(), variables, header, m.keyHeaders), true
+}
+
+func isEventStream(contentType string) bool {
+	if contentType == "" {
+		return false
+	}
+	mt, _, err := mime.ParseMediaType(contentType)
+	return err == nil && mt == "text/event-stream"
 }
 
 // Interface guards.
 var (
-	_ core.Module                            = (*Module)(nil)
-	_ core.Provisioner                       = (*Module)(nil)
-	_ core.SubscriptionOnStartHandler        = (*Module)(nil)
-	_ core.StreamBeforeEventsDispatchHandler = (*Module)(nil)
+	_ core.Module                     = (*Module)(nil)
+	_ core.Provisioner                = (*Module)(nil)
+	_ core.EnginePostOriginHandler    = (*Module)(nil)
+	_ core.SubscriptionOnStartHandler = (*Module)(nil)
 )

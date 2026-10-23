@@ -1,4 +1,6 @@
 /router
 /bin/
 .env
-config.yaml
+/config.yaml
+e2e/bin/
+e2e/out/

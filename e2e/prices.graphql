@@ -1,0 +1,12 @@
+type Query {
+  hello: String
+}
+
+type Price {
+  symbol: String!
+  value: Int!
+}
+
+type Subscription {
+  price(symbol: String!): Price!
+}

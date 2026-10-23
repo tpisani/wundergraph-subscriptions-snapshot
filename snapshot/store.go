@@ -7,8 +7,10 @@ import (
 	"time"
 )
 
-// store is a concurrency-safe, size-bounded LRU of the last event payload
-// seen for each subscription key. Entries can optionally expire after a TTL.
+// store is a concurrency-safe, size-bounded LRU of the last payload seen for
+// each subscription key. Every entry records which upstream stream (owner)
+// wrote it, so a stream that is shutting down can only remove its own entry
+// and never one written by a newer stream for the same key.
 type store struct {
 	mu         sync.Mutex
 	ttl        time.Duration // 0 = never expires
@@ -20,6 +22,7 @@ type store struct {
 
 type entry struct {
 	key       string
+	owner     uint64
 	data      []byte
 	updatedAt time.Time
 }
@@ -34,8 +37,8 @@ func newStore(maxEntries int, ttl time.Duration) *store {
 	}
 }
 
-// Set stores a copy of data as the latest payload for key.
-func (s *store) Set(key string, data []byte) {
+// Set stores a copy of data as the latest payload for key, written by owner.
+func (s *store) Set(key string, owner uint64, data []byte) {
 	data = slices.Clone(data)
 
 	s.mu.Lock()
@@ -43,13 +46,14 @@ func (s *store) Set(key string, data []byte) {
 
 	if el, ok := s.items[key]; ok {
 		e := el.Value.(*entry)
+		e.owner = owner
 		e.data = data
 		e.updatedAt = s.now()
 		s.ll.MoveToFront(el)
 		return
 	}
 
-	s.items[key] = s.ll.PushFront(&entry{key: key, data: data, updatedAt: s.now()})
+	s.items[key] = s.ll.PushFront(&entry{key: key, owner: owner, data: data, updatedAt: s.now()})
 
 	if s.maxEntries > 0 {
 		for s.ll.Len() > s.maxEntries {
@@ -76,6 +80,16 @@ func (s *store) Get(key string) ([]byte, bool) {
 
 	s.ll.MoveToFront(el)
 	return slices.Clone(e.data), true
+}
+
+// DeleteOwned removes the entry for key only if it was last written by owner.
+func (s *store) DeleteOwned(key string, owner uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if el, ok := s.items[key]; ok && el.Value.(*entry).owner == owner {
+		s.removeElement(el)
+	}
 }
 
 // Len returns the number of stored entries (including not yet evicted expired ones).

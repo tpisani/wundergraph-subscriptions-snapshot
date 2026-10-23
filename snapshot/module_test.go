@@ -2,49 +2,76 @@ package snapshot
 
 import (
 	"context"
+	"io"
 	"net/http"
+	"strings"
 	"testing"
 
+	"github.com/mitchellh/mapstructure"
+	"github.com/wundergraph/astjson"
 	"github.com/wundergraph/cosmo/router/core"
 	"github.com/wundergraph/cosmo/router/pkg/authentication"
 	"github.com/wundergraph/cosmo/router/pkg/pubsub/datasource"
-	"github.com/wundergraph/cosmo/router/pkg/pubsub/kafka"
 	"github.com/wundergraph/cosmo/router/pkg/pubsub/nats"
 	"go.uber.org/zap"
 )
 
-type testEvent struct{ data []byte }
-
-func (e *testEvent) GetData() []byte                       { return e.data }
-func (e *testEvent) SetData(d []byte)                      { e.data = d }
-func (e *testEvent) Clone() datasource.MutableStreamEvent { return &testEvent{data: append([]byte(nil), e.data...)} }
-
-type dispatchCtx struct{ cfg datasource.SubscriptionEventConfiguration }
-
-func (c *dispatchCtx) Context() context.Context { return context.Background() }
-func (c *dispatchCtx) Logger() *zap.Logger      { return zap.NewNop() }
-func (c *dispatchCtx) SubscriptionEventConfiguration() datasource.SubscriptionEventConfiguration {
-	return c.cfg
-}
-func (c *dispatchCtx) NewEvent(d []byte) datasource.MutableStreamEvent { return &testEvent{data: d} }
-
-type startCtx struct {
-	cfg     datasource.SubscriptionEventConfiguration
-	emitted [][]byte
+// fakeOp implements core.OperationContext; unused methods panic via the nil
+// embedded interface.
+type fakeOp struct {
+	core.OperationContext
+	name, typ string
+	hash      uint64
+	vars      string
 }
 
-func (c *startCtx) Request() *http.Request                        { return nil }
-func (c *startCtx) Logger() *zap.Logger                           { return zap.NewNop() }
-func (c *startCtx) Operation() core.OperationContext              { return nil }
-func (c *startCtx) Authentication() authentication.Authentication { return nil }
-func (c *startCtx) SubscriptionEventConfiguration() datasource.SubscriptionEventConfiguration {
-	return c.cfg
+func (o *fakeOp) Name() string { return o.name }
+func (o *fakeOp) Type() string { return o.typ }
+func (o *fakeOp) Hash() uint64 { return o.hash }
+func (o *fakeOp) Variables() *astjson.Value {
+	if o.vars == "" {
+		return nil
+	}
+	return astjson.MustParse(o.vars)
 }
-func (c *startCtx) EmitEvent(e datasource.StreamEvent) bool {
-	c.emitted = append(c.emitted, e.GetData())
+
+// fakeReqCtx implements core.RequestContext for OnOriginResponse.
+type fakeReqCtx struct {
+	core.RequestContext
+	op  core.OperationContext
+	req *http.Request
+}
+
+func (c *fakeReqCtx) Operation() core.OperationContext { return c.op }
+func (c *fakeReqCtx) Request() *http.Request           { return c.req }
+
+type fakeEvent struct{ data []byte }
+
+func (e *fakeEvent) GetData() []byte                      { return e.data }
+func (e *fakeEvent) SetData(d []byte)                     { e.data = d }
+func (e *fakeEvent) Clone() datasource.MutableStreamEvent { return &fakeEvent{data: e.data} }
+
+// fakeStartCtx implements core.SubscriptionOnStartHandlerContext for an
+// engine (subgraph) subscription.
+type fakeStartCtx struct {
+	op      core.OperationContext
+	req     *http.Request
+	evCfg   datasource.SubscriptionEventConfiguration
+	emitted []string
+}
+
+func (c *fakeStartCtx) Request() *http.Request                        { return c.req }
+func (c *fakeStartCtx) Logger() *zap.Logger                           { return zap.NewNop() }
+func (c *fakeStartCtx) Operation() core.OperationContext              { return c.op }
+func (c *fakeStartCtx) Authentication() authentication.Authentication { return nil }
+func (c *fakeStartCtx) SubscriptionEventConfiguration() datasource.SubscriptionEventConfiguration {
+	return c.evCfg
+}
+func (c *fakeStartCtx) EmitEvent(e datasource.StreamEvent) bool {
+	c.emitted = append(c.emitted, string(e.GetData()))
 	return true
 }
-func (c *startCtx) NewEvent(d []byte) datasource.MutableStreamEvent { return &testEvent{data: d} }
+func (c *fakeStartCtx) NewEvent(d []byte) datasource.MutableStreamEvent { return &fakeEvent{data: d} }
 
 func provisioned(t *testing.T, m *Module) *Module {
 	t.Helper()
@@ -54,102 +81,170 @@ func provisioned(t *testing.T, m *Module) *Module {
 	return m
 }
 
-func events(payloads ...string) datasource.StreamEvents {
-	evts := make([]datasource.StreamEvent, 0, len(payloads))
-	for _, p := range payloads {
-		evts = append(evts, &testEvent{data: []byte(p)})
+func clientReq(auth string) *http.Request {
+	r, _ := http.NewRequest(http.MethodPost, "http://router/graphql", nil)
+	if auth != "" {
+		r.Header.Set("Authorization", auth)
 	}
-	return datasource.NewStreamEvents(evts)
+	return r
 }
 
-func natsCfg(field string, subjects ...string) *nats.SubscriptionEventConfiguration {
-	return &nats.SubscriptionEventConfiguration{Provider: "default", Subjects: subjects, FieldName: field}
+func sseResponse(stream string) *http.Response {
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream; charset=utf-8"}},
+		Body:       io.NopCloser(strings.NewReader(stream)),
+	}
 }
 
-func TestReplaysLastEventToNewSubscriber(t *testing.T) {
+var priceOp = &fakeOp{name: "OnPrice", typ: "subscription", hash: 42, vars: `{"symbol":"ABC"}`}
+
+// upstream simulates the engine reading the subgraph SSE stream that was
+// opened for the first subscriber (the trigger owner).
+func upstream(t *testing.T, m *Module, op core.OperationContext, auth, stream string) *http.Response {
+	t.Helper()
+	resp := sseResponse(stream)
+	if out := m.OnOriginResponse(resp, &fakeReqCtx{op: op, req: clientReq(auth)}); out != nil {
+		t.Fatal("handler must modify in place and return nil")
+	}
+	return resp
+}
+
+func TestReplaysLastUpstreamMessageToLateSubscriber(t *testing.T) {
 	m := provisioned(t, &Module{})
-	cfg := natsCfg("employeeUpdated", "employeeUpdated.1")
+	stream := "event: next\ndata: {\"data\":{\"price\":1}}\n\nevent: next\ndata: {\"data\":{\"price\":2}}\n\n"
+	resp := upstream(t, m, priceOp, "Bearer alice", stream)
 
-	out, err := m.BeforeEventsDispatch(&dispatchCtx{cfg: cfg}, events(
-		`{"__typename":"Employee","id":1,"v":1}`,
-		`{"__typename":"Employee","id":1,"v":2}`,
-	))
+	// Read only part of the stream: the subscription is still live.
+	buf := make([]byte, len(stream))
+	n, _ := io.ReadFull(resp.Body, buf)
+	if string(buf[:n]) != stream {
+		t.Fatal("engine must see the original stream")
+	}
+
+	late := &fakeStartCtx{op: &fakeOp{name: "OnPrice", typ: "subscription", hash: 42, vars: `{"symbol":"ABC"}`}, req: clientReq("Bearer alice")}
+	if err := m.SubscriptionOnStart(late); err != nil {
+		t.Fatal(err)
+	}
+	if len(late.emitted) != 1 || late.emitted[0] != `{"data":{"price":2}}` {
+		t.Fatalf("expected latest upstream message, got %q", late.emitted)
+	}
+}
+
+func TestDoesNotLeakAcrossUsersOrVariables(t *testing.T) {
+	m := provisioned(t, &Module{})
+	resp := upstream(t, m, priceOp, "Bearer alice", "event: next\ndata: {\"data\":{\"price\":1}}\n\n")
+	buf := make([]byte, 64)
+	_, _ = resp.Body.Read(buf)
+
+	for name, sc := range map[string]*fakeStartCtx{
+		"other user":      {op: priceOp, req: clientReq("Bearer bob")},
+		"anonymous":       {op: priceOp, req: clientReq("")},
+		"other variables": {op: &fakeOp{name: "OnPrice", typ: "subscription", hash: 42, vars: `{"symbol":"XYZ"}`}, req: clientReq("Bearer alice")},
+		"other operation": {op: &fakeOp{name: "OnPrice", typ: "subscription", hash: 43, vars: `{"symbol":"ABC"}`}, req: clientReq("Bearer alice")},
+	} {
+		_ = m.SubscriptionOnStart(sc)
+		if len(sc.emitted) != 0 {
+			t.Fatalf("%s must not receive the snapshot", name)
+		}
+	}
+}
+
+func TestSnapshotDroppedWhenUpstreamEnds(t *testing.T) {
+	m := provisioned(t, &Module{})
+	resp := upstream(t, m, priceOp, "Bearer alice", "event: next\ndata: {\"data\":{\"price\":1}}\n\n")
+	_, _ = io.ReadAll(resp.Body) // stream ends (EOF)
+	_ = resp.Body.Close()
+
+	sc := &fakeStartCtx{op: priceOp, req: clientReq("Bearer alice")}
+	_ = m.SubscriptionOnStart(sc)
+	if len(sc.emitted) != 0 {
+		t.Fatal("a finished upstream stream must not leave a snapshot behind")
+	}
+}
+
+func TestIgnoresNonSubscriptionAndNonSSEResponses(t *testing.T) {
+	m := provisioned(t, &Module{})
+
+	query := &fakeOp{name: "Q", typ: "query", hash: 1}
+	resp := sseResponse("event: next\ndata: {\"data\":{\"a\":1}}\n\n")
+	orig := resp.Body
+	m.OnOriginResponse(resp, &fakeReqCtx{op: query, req: clientReq("")})
+	if resp.Body != orig {
+		t.Fatal("queries must not be tapped")
+	}
+
+	jsonResp := &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(`{}`))}
+	orig = jsonResp.Body
+	m.OnOriginResponse(jsonResp, &fakeReqCtx{op: priceOp, req: clientReq("")})
+	if jsonResp.Body != orig {
+		t.Fatal("non-SSE responses (e.g. entity fetches) must not be tapped")
+	}
+
+	if m.OnOriginResponse(nil, &fakeReqCtx{op: priceOp}) != nil {
+		t.Fatal("nil response must be ignored")
+	}
+}
+
+func TestOperationsAllowlist(t *testing.T) {
+	m := provisioned(t, &Module{Operations: []string{"Other"}})
+	resp := sseResponse("event: next\ndata: {\"data\":{\"a\":1}}\n\n")
+	orig := resp.Body
+	m.OnOriginResponse(resp, &fakeReqCtx{op: priceOp, req: clientReq("")})
+	if resp.Body != orig {
+		t.Fatal("operations outside the allowlist must not be tapped")
+	}
+}
+
+func TestSkipsEDFSSubscriptions(t *testing.T) {
+	m := provisioned(t, &Module{})
+	resp := upstream(t, m, priceOp, "", "event: next\ndata: {\"data\":{\"a\":1}}\n\n")
+	_, _ = resp.Body.Read(make([]byte, 64))
+
+	sc := &fakeStartCtx{op: priceOp, req: clientReq(""), evCfg: &nats.SubscriptionEventConfiguration{Subjects: []string{"x"}}}
+	_ = m.SubscriptionOnStart(sc)
+	if len(sc.emitted) != 0 {
+		t.Fatal("EDFS subscriptions are out of scope")
+	}
+}
+
+func TestConfigDecoding(t *testing.T) {
+	// The router decodes module config with mapstructure.Decode.
+	m := &Module{}
+	err := mapstructure.Decode(map[string]any{
+		"key_headers":     []any{"authorization", "x-tenant-id", "X-Tenant-Id"},
+		"operations":      []any{"OnPrice"},
+		"ttl":             "5m",
+		"max_entries":     5,
+		"max_event_bytes": 2048,
+	}, m)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out.Len() != 2 {
-		t.Fatal("events must pass through unchanged")
+	provisioned(t, m)
+	if strings.Join(m.keyHeaders, ",") != "Authorization,X-Tenant-Id" {
+		t.Fatalf("headers must be canonicalized, sorted and deduplicated: %v", m.keyHeaders)
 	}
 
-	sc := &startCtx{cfg: natsCfg("employeeUpdated", "employeeUpdated.1")}
-	if err := m.SubscriptionOnStart(sc); err != nil {
+	def := provisioned(t, &Module{})
+	if strings.Join(def.keyHeaders, ",") != "Authorization" {
+		t.Fatalf("default key header must be Authorization, got %v", def.keyHeaders)
+	}
+
+	empty := &Module{}
+	if err := mapstructure.Decode(map[string]any{"key_headers": []any{}}, empty); err != nil {
 		t.Fatal(err)
 	}
-	if len(sc.emitted) != 1 || string(sc.emitted[0]) != `{"__typename":"Employee","id":1,"v":2}` {
-		t.Fatalf("expected last event of batch, got %q", sc.emitted)
+	provisioned(t, empty)
+	if len(empty.keyHeaders) != 0 {
+		t.Fatalf("an explicit empty list must disable header keys, got %v", empty.keyHeaders)
 	}
 }
 
-func TestNoSnapshotForOtherSubjectOrEmptyStore(t *testing.T) {
-	m := provisioned(t, &Module{})
-
-	sc := &startCtx{cfg: natsCfg("employeeUpdated", "employeeUpdated.1")}
-	_ = m.SubscriptionOnStart(sc)
-	if len(sc.emitted) != 0 {
-		t.Fatal("nothing should be emitted before any event")
-	}
-
-	_, _ = m.BeforeEventsDispatch(&dispatchCtx{cfg: natsCfg("employeeUpdated", "employeeUpdated.1")}, events(`{"id":1}`))
-
-	other := &startCtx{cfg: natsCfg("employeeUpdated", "employeeUpdated.2")}
-	_ = m.SubscriptionOnStart(other)
-	if len(other.emitted) != 0 {
-		t.Fatal("snapshot must not leak to a different subject")
-	}
-}
-
-func TestKeyIgnoresSubjectOrderButSeparatesProviders(t *testing.T) {
-	m := provisioned(t, &Module{})
-	_, _ = m.BeforeEventsDispatch(&dispatchCtx{cfg: natsCfg("f", "b", "a")}, events(`{"id":1}`))
-
-	same := &startCtx{cfg: natsCfg("f", "a", "b")}
-	_ = m.SubscriptionOnStart(same)
-	if len(same.emitted) != 1 {
-		t.Fatal("subject order must not matter")
-	}
-
-	kafkaSc := &startCtx{cfg: &kafka.SubscriptionEventConfiguration{Provider: "default", Topics: []string{"a", "b"}, FieldName: "f"}}
-	_ = m.SubscriptionOnStart(kafkaSc)
-	if len(kafkaSc.emitted) != 0 {
-		t.Fatal("snapshot must not leak across provider types")
-	}
-}
-
-func TestFieldsAllowlist(t *testing.T) {
-	m := provisioned(t, &Module{Fields: []string{"employeeUpdated"}})
-
-	_, _ = m.BeforeEventsDispatch(&dispatchCtx{cfg: natsCfg("other", "x")}, events(`{"id":1}`))
-	sc := &startCtx{cfg: natsCfg("other", "x")}
-	_ = m.SubscriptionOnStart(sc)
-	if len(sc.emitted) != 0 {
-		t.Fatal("fields outside the allowlist must be ignored")
-	}
-}
-
-func TestEngineSubscriptionsAreIgnored(t *testing.T) {
-	m := provisioned(t, &Module{})
-	sc := &startCtx{cfg: nil}
-	if err := m.SubscriptionOnStart(sc); err != nil {
-		t.Fatal(err)
-	}
-	if len(sc.emitted) != 0 {
-		t.Fatal("engine subscriptions have no event config and must be skipped")
-	}
-}
-
-func TestInvalidTTL(t *testing.T) {
-	m := &Module{TTL: "banana"}
-	if err := m.Provision(&core.ModuleContext{Context: context.Background(), Module: m, Logger: zap.NewNop()}); err == nil {
-		t.Fatal("expected error for invalid ttl")
+func TestInvalidConfig(t *testing.T) {
+	for _, m := range []*Module{{TTL: "banana"}, {TTL: "-1s"}, {MaxEventBytes: -1}} {
+		if err := m.Provision(&core.ModuleContext{Context: context.Background(), Module: m, Logger: zap.NewNop()}); err == nil {
+			t.Fatalf("expected error for %+v", m)
+		}
 	}
 }

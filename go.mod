@@ -3,6 +3,8 @@ module github.com/tpisani/wundergraph-subscriptions-snapshot
 go 1.26.0
 
 require (
+	github.com/mitchellh/mapstructure v1.5.0
+	github.com/wundergraph/astjson v1.1.0
 	github.com/wundergraph/cosmo/router v0.0.0-20261022111236-14f049cc69f0
 	go.uber.org/zap v1.27.1
 )
@@ -80,7 +82,6 @@ require (
 	github.com/minio/md5-simd v1.1.2 // indirect
 	github.com/minio/minio-go/v7 v7.0.74 // indirect
 	github.com/mitchellh/go-homedir v1.1.0 // indirect
-	github.com/mitchellh/mapstructure v1.5.0 // indirect
 	github.com/modelcontextprotocol/go-sdk v1.7.0 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
 	github.com/nats-io/nats.go v1.50.0 // indirect
@@ -124,7 +125,6 @@ require (
 	github.com/twmb/franz-go v1.16.1 // indirect
 	github.com/twmb/franz-go/pkg/kmsg v1.7.0 // indirect
 	github.com/vbatts/tar-split v0.12.1 // indirect
-	github.com/wundergraph/astjson v1.1.0 // indirect
 	github.com/wundergraph/go-arena v1.3.0 // indirect
 	github.com/wundergraph/graphql-go-tools/v2 v2.30.0 // indirect
 	github.com/yosida95/uritemplate/v3 v3.0.2 // indirect

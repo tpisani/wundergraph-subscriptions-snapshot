@@ -1,20 +1,27 @@
 # yaml-language-server: $schema=https://raw.githubusercontent.com/wundergraph/cosmo/main/router/pkg/config/config.schema.json
 version: "1"
 
-events:
-  providers:
-    nats:
-      - id: default
-        url: "nats://localhost:4222"
+# The subgraphs that serve subscriptions must use SSE towards the router:
+#   npx wgc subgraph publish prices --subscription-protocol sse_post ...
+# (or `subscription: { protocol: sse_post }` in a local graph.yaml).
+# Clients can keep using graphql-ws, SSE or multipart.
 
 modules:
   subscriptionSnapshot:
-    # Root subscription fields that get a snapshot. Empty/omitted = every
-    # Cosmo Streams (EDFS) subscription.
-    fields:
-      - employeeUpdated
+    # Client headers that identify who may see a snapshot. Clients only receive
+    # a snapshot recorded for the same operation, variables AND these header
+    # values. Default: [Authorization]. An explicit [] disables header keys.
+    key_headers:
+      - Authorization
+      # - X-Tenant-Id
+    # Subscription operation names that get a snapshot. Empty = all.
+    operations: []
     # Discard snapshots older than this (Go duration). Empty or "0" = never.
-    ttl: "10m"
-    # Max number of distinct subscriptions (provider + subjects) kept in memory.
+    # Snapshots are always dropped when the upstream stream ends.
+    ttl: ""
+    # Max number of distinct subscriptions kept in memory (LRU).
     # 0 = default (10000), -1 = unbounded.
     max_entries: 10000
+    # Largest SSE event tracked; bigger events stop tracking that stream.
+    # 0 = default (1 MiB).
+    max_event_bytes: 1048576

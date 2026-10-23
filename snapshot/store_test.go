@@ -12,8 +12,8 @@ func TestStoreSetGet(t *testing.T) {
 		t.Fatal("expected miss on empty store")
 	}
 
-	s.Set("a", []byte(`1`))
-	s.Set("a", []byte(`2`))
+	s.Set("a", 1, []byte(`1`))
+	s.Set("a", 1, []byte(`2`))
 
 	got, ok := s.Get("a")
 	if !ok || string(got) != "2" {
@@ -24,7 +24,7 @@ func TestStoreSetGet(t *testing.T) {
 func TestStoreCopiesData(t *testing.T) {
 	s := newStore(10, 0)
 	buf := []byte(`abc`)
-	s.Set("a", buf)
+	s.Set("a", 1, buf)
 	buf[0] = 'X'
 
 	got, _ := s.Get("a")
@@ -38,12 +38,28 @@ func TestStoreCopiesData(t *testing.T) {
 	}
 }
 
+func TestStoreDeleteOwnedOnlyRemovesOwnEntry(t *testing.T) {
+	s := newStore(10, 0)
+	s.Set("a", 1, []byte(`old`))
+	s.Set("a", 2, []byte(`new`)) // a newer stream took over the key
+
+	s.DeleteOwned("a", 1) // old stream closes late
+	if got, ok := s.Get("a"); !ok || string(got) != "new" {
+		t.Fatalf("old stream must not delete the newer snapshot, got %q ok=%v", got, ok)
+	}
+
+	s.DeleteOwned("a", 2)
+	if _, ok := s.Get("a"); ok {
+		t.Fatal("owner should be able to delete its entry")
+	}
+}
+
 func TestStoreLRUEviction(t *testing.T) {
 	s := newStore(2, 0)
-	s.Set("a", []byte(`a`))
-	s.Set("b", []byte(`b`))
+	s.Set("a", 1, []byte(`a`))
+	s.Set("b", 1, []byte(`b`))
 	s.Get("a") // a becomes most recently used
-	s.Set("c", []byte(`c`))
+	s.Set("c", 1, []byte(`c`))
 
 	if _, ok := s.Get("b"); ok {
 		t.Fatal("expected b to be evicted")
@@ -61,7 +77,7 @@ func TestStoreTTL(t *testing.T) {
 	s := newStore(10, time.Minute)
 	s.now = func() time.Time { return now }
 
-	s.Set("a", []byte(`a`))
+	s.Set("a", 1, []byte(`a`))
 	now = now.Add(30 * time.Second)
 	if _, ok := s.Get("a"); !ok {
 		t.Fatal("expected hit before ttl")
